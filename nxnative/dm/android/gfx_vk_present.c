@@ -1020,7 +1020,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     static ANativeWindow *rate_win; static double rate_period, want_period; static uint64_t want_since;
     if (period != want_period) { want_period = period; want_since = g_presents; }
     if (g_win && (g_win != rate_win || (period != rate_period && (period < rate_period || g_presents - want_since >= 60)))) { rate_win = g_win; rate_period = period; dm_perf_window(g_win, period > 0 ? 1.0 / period : 60); }
-    uint64_t n = ++g_presents;
+    uint64_t n = ++g_presents; vk_sync_frame(n);
     // without display times (no VK_GOOGLE_display_timing, no window, or none came back) the hand-over time stands in, as before: the governor's late check needs readings
     { int disp = V.has_dtiming && dm_front_window() && (n <= 240 || g_pres_recorded); struct timespec ts; if (!disp) clock_gettime(CLOCK_MONOTONIC, &ts);
       present_time_begin(n, disp ? 0 : (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec); }
@@ -1078,7 +1078,7 @@ vkimg_t *vk_image_from_ahb(AHardwareBuffer *ahb, uint32_t w, uint32_t h) {
 uint64_t vk_present_vkimg(vkimg_t *im, double period) {
     vk_init();
     dm_perf_frame(period);
-    uint64_t n = ++g_presents;
+    uint64_t n = ++g_presents; vk_sync_frame(n);
     { int disp = V.has_dtiming && dm_front_window() && (n <= 240 || g_pres_recorded); struct timespec ts; if (!disp) clock_gettime(CLOCK_MONOTONIC, &ts);
       present_time_begin(n, disp ? 0 : (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec); }
     atomic_fetch_add(&g_fps_frames, 1);

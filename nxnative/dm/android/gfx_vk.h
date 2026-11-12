@@ -185,3 +185,6 @@ enum { PT_DISPATCH = 0xd15 };   // vk_pass_ts: a dispatch timed as a pass (its f
 
 // Mark driver cache updates, including same-sized payload changes.
 void vk_pipeline_cache_changed(void);
+
+#include "gfx_vk_sync.h"
+#include "gfx_vk_sync_commands.h"

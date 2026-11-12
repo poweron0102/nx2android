@@ -857,16 +857,16 @@ static VkCommandBuffer g_slot_main_cb(void) { return g_slot[g_cur].main; }
 // DM_VK_PASS_TIMES=1: a timestamp before and after every render pass (the replay's per-frame line then lists the passes that cost the most GPU time)
 enum { PASSQ = 512 };   // passes (and dispatches) timed per submission
 static VkQueryPool g_pq; static int g_pq_on = -1;
-typedef struct { uint32_t w, h, fmt, draws, fidx; } pass_meta;   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
+typedef struct { uint32_t w, h, fmt, draws, fidx, sync_id; } pass_meta;   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
 enum { FPASSQ = 512 }; static int g_fpass;   // passes of the frame so far
 void vk_pass_frame(void) { g_fpass = 0; }   // a present: the next pass is the frame's first
 static pass_meta g_pmeta[NSLOT][PASSQ]; static int g_npass[NSLOT];
 static double g_pacc[FPASSQ]; static uint32_t g_pcnt[FPASSQ]; static pass_meta g_plast[FPASSQ]; static int g_pmax;   // by the pass's place in its frame (the completion thread adds)
 static int pass_times_on(void) { if (g_pq_on < 0) { const char *e = getenv("DM_VK_PASS_TIMES"); g_pq_on = e && atoi(e); } return g_pq_on && g_pq; }
 void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws) {
-    if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) return;
+    if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) { if(end) vk_sync_query_overflow(); return; }
     vkCmdWriteTimestamp(g_slot_main_cb(), end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, (uint32_t)(g_cur * PASSQ * 2 + *n * 2 + end));
-    if (end) { g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1)}; (*n)++; g_fpass++; }
+    if (end) { g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1), vk_sync_last_id()}; (*n)++; g_fpass++; }
 }
 void vk_pass_report(void) {   // the most expensive passes since the last report, then the counters start again
     if (!pass_times_on()) return;
@@ -976,14 +976,14 @@ static void vk_cmd_split_(void) {
     }
     if (s->nmain_used == s->nmain_alloc) { VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         VKCHK(vkAllocateCommandBuffers(V.dev, &ai, &s->mains[s->nmain_alloc])); s->nmain_alloc++; }
-    s->main = s->mains[s->nmain_used++];
+    s->main = s->mains[s->nmain_used++]; vk_sync_register_cb(s->main,0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
 }   // outside a submission nothing may be recorded (present, a pool finalized between frames)
-VkCommandBuffer vk_cmd(void) { return cur()->main; }
+VkCommandBuffer vk_cmd(void) { VkCommandBuffer cb=cur()->main; vk_sync_register_cb(cb,0); return cb; }
 int vk_cmd_parts_left(void) { vksub_t *s = cur(); return MAIN_CBS - (s->nmain_used > s->nup_used ? s->nmain_used : s->nup_used); }   // parts vk_cmd_split can still begin (gfx_vk_exec.c pass splits)
 uint64_t g_up_gen;   // upload command buffers begun (gfx_vk_tex.c lin_copy: once per upload buffer)
 VkCommandBuffer vk_upload_cmd(void) {
-    vksub_t *s = cur();
+    vksub_t *s = cur(); vk_sync_register_cb(s->up,1);
     if (!s->up_used) { VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->up, &bi)); s->up_used = 1; g_up_gen++; }
     return s->up;
 }
@@ -1114,6 +1114,8 @@ static void pools_readback_barrier(VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, NULL, 0, NULL);
 }
 void mtl_sub_begin(void) {
+    vk_sync_init();
+    vk_sync_cancel();
     vk_init();
     pthread_mutex_lock(&g_sub_lock);
     // the next slot of the ring (g_cur is -1 between submissions, so it cannot say where the ring is: every submission took slot 0 and waited in slot_recycle
@@ -1123,7 +1125,7 @@ void mtl_sub_begin(void) {
     s->npost = 0; s->up_used = 0; s->ngw = 0;
     { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e && atoi(e); }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
+    s->main = s->mains[0]; vk_sync_register_cb(s->main,0); s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
     VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
     // copied pools: what the game wrote before submitting goes into the GPU copy before any part of the submission can reach the GPU (DM_VK_CB_DRAWS sends
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
@@ -1150,7 +1152,7 @@ static VkMemoryBarrier2 full_barrier(void) {
     return (VkMemoryBarrier2){VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                               VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
 }
-void vk_img_barrier_all(VkCommandBuffer cb) {
+void (vk_img_barrier_all)(VkCommandBuffer cb) {
     VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, NULL, 0, NULL);
 }
@@ -1159,7 +1161,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n) return;
     if (!vk_buf_at(src, n, &sb, &so) || !vk_buf_at(dst, n, &db, &dof)) { VKRED_ONCE(1, "buffer copy outside the memory pools (%#llx → %#llx, %llu bytes)", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n); return; }
-    vk_end_pass_land();
+    vk_sync_end_land_at(__FILE__, __LINE__);
     VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
     VkBufferCopy r = {so, dof, n}; vkCmdCopyBuffer(cb, sb, db, 1, &r);
     vk_img_barrier_all(cb); vk_gpu_wrote(dst, n);
@@ -1168,7 +1170,7 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     VkBuffer db; VkDeviceSize dof;
     if (!n) return;
     if (!vk_buf_at(dst, n, &db, &dof)) { VKRED_ONCE(2, "buffer fill outside the memory pools"); return; }
-    vk_end_pass_land();
+    vk_sync_end_land_at(__FILE__, __LINE__);
     VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
     vkCmdFillBuffer(cb, db, dof, n & ~3ull, value);
     vk_img_barrier_all(cb); vk_gpu_wrote(dst, n);
@@ -1190,7 +1192,7 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     // an update of exactly the range of a deferred one supersedes it: the older one goes (Unity rewrites the same few constant buffers before every draw,
     // so the list keeps about one entry per buffer region, which keeps the landing to a few copies and the shadows cheap to build)
     for (int i = g_nubd - 1; i >= 0; i--) if (g_ubd[i].lo == dst && g_ubd[i].hi == dst + n) { memmove(&g_ubd[i], &g_ubd[i + 1], sizeof *g_ubd * (size_t)(g_nubd - i - 1)); g_nubd--; g_ubd_superseded++; break; }
-    if (g_nubd == UBD_MAX) vk_end_pass_land();   // too many distinct ranges: they land now
+    if (g_nubd == UBD_MAX) vk_sync_end_land_at(__FILE__, __LINE__);   // too many distinct ranges: they land now
     uint8_t *p = vk_scratch(n, 4, &sb, &so); memcpy(p, data, n);
     g_ubd[g_nubd++] = (ubd_t){dst, dst + n, sb, so, p}; g_ubd_gen++;
 }
@@ -1333,7 +1335,7 @@ static void *completion_main(void *a) {
             int np = c->npass; uint64_t t[PASSQ * 2];
             if (c->frame != g_sf_frame) { pass_spike_flush(); g_sf_frame = c->frame; }
             if (np && vkGetQueryPoolResults(V.dev, g_pq, (uint32_t)(c->slot * PASSQ * 2), (uint32_t)np * 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-                for (int i = 0; i < np; i++) if (t[2 * i + 1] > t[2 * i]) { pass_spike_add((double)(t[2 * i + 1] - t[2 * i]) * V.props.limits.timestampPeriod / 1e6, &c->pmeta[i]); int f = (int)c->pmeta[i].fidx; g_pacc[f] += (double)(t[2 * i + 1] - t[2 * i]) * V.props.limits.timestampPeriod / 1e6; g_pcnt[f]++; g_plast[f] = c->pmeta[i]; if (f + 1 > g_pmax) g_pmax = f + 1; }
+                for (int i = 0; i < np; i++) if (t[2 * i + 1] > t[2 * i]) { vk_sync_gpu(c->pmeta[i].sync_id, (uint64_t)((double)(t[2*i+1]-t[2*i])*V.props.limits.timestampPeriod)); pass_spike_add((double)(t[2 * i + 1] - t[2 * i]) * V.props.limits.timestampPeriod / 1e6, &c->pmeta[i]); int f = (int)c->pmeta[i].fidx; g_pacc[f] += (double)(t[2 * i + 1] - t[2 * i]) * V.props.limits.timestampPeriod / 1e6; g_pcnt[f]++; g_plast[f] = c->pmeta[i]; if (f + 1 > g_pmax) g_pmax = f + 1; }
         }
         uint64_t now = gpu_ticks(), tend = 0;
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) tend = t[1]; }
@@ -1358,7 +1360,7 @@ static void completion_start(void) { pthread_t t; if (pthread_create(&t, NULL, c
 uint64_t mtl_sub_commit(void) {
     { void vk_prof_end(void); vk_prof_end(); }
     vksub_t *s = cur();
-    vk_end_pass_land();
+    vk_sync_end_land_at(__FILE__, __LINE__);
     pools_readback_barrier(s->main);
     if (g_tsq) vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur + 1);
     VkResult er = vkEndCommandBuffer(s->main); if (s->cb_err && er >= 0) er = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1371,7 +1373,7 @@ uint64_t mtl_sub_commit(void) {
             s->nmain_sent = s->nmain_used; s->up_used = 0; s->cb_err = 0; s->no_ts = 1; vk_ubd_land_drop();
         } else {
             vkResetCommandPool(V.dev, s->pool, 0); VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-            s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->no_ts = 1;   // no timestamps: the slot's queries still hold an older submission's
+            s->main = s->mains[0]; vk_sync_register_cb(s->main,0); s->nmain_used = 1; s->cb_err = 0; s->no_ts = 1;   // no timestamps: the slot's queries still hold an older submission's
             if (s->nup_used > 1) { s->up = s->ups[0]; s->nup_used = 1; }
             VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++; s->up_used = 0; vk_ubd_land_drop();
             pools_readback_barrier(s->main);

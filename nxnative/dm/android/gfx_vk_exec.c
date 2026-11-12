@@ -234,7 +234,7 @@ static void color_alias_map(uint32_t n, const VkImageView views[8], uint32_t mas
 static void bind_chmask(uint32_t mask) {
     if (S.pass_open && mask!=S.chmask.mask) {
         uint8_t map[8];color_alias_map((uint32_t)S.ncol,P_alias_views,mask,map);
-        if (memcmp(map,P_alias,sizeof map)) vk_end_pass();
+        if (memcmp(map,P_alias,sizeof map)) vk_sync_end_at(__FILE__, __LINE__);
     }
     S.chmask.mask=mask;
 }
@@ -352,7 +352,19 @@ static int pass_commit(void) {
         else if (V.has_dynrender) { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
         else { VKRED_ONCE(76, "render pass or framebuffer failed without dynamic rendering: pass skipped"); return 0; }   // (still pass_open 2: vk_end_pass drops it)
     } else { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
-    S.pass_open = 1; g_vkst.passes++; g_sub_pass++; g_pass_wmem = 0;
+    S.pass_open = 1;
+    if (g_vk_sync_level >= 2) {
+        vk_sync_pass p; memset(&p,0,sizeof p); p.w=S.pass_w; p.h=S.pass_h; p.samples=S.samples;
+        for(int a=0;a<9;++a) if(P_att[a].im) {
+            vkimg_t *im=P_att[a].im; vk_sync_attachment *x=&p.att[a];
+            const view_t *v=a==8 ? (S.rt_has_dview ? &S.rt_dview:NULL) : (S.rt_has_cview[a] ? &S.rt_cview[a]:NULL);
+            x->pool=im->pool;x->off=im->off;x->size=im->size;x->fmt=P_att[a].fmt;x->w=P_att[a].w;x->h=P_att[a].h;x->samples=im->samples;x->aspect=im->aspect;
+            x->level=v && v->set_levels ? v->base_level:0;x->layer=v && v->set_layers ? v->min_layer:0;x->layers=P_att[a].layers;
+            x->load=a==8 ? P_da.loadOp:P_ca[a].loadOp;x->store=a==8 ? P_da.storeOp:P_ca[a].storeOp;
+        }
+        vk_sync_pass_begin(&p);
+    }
+    g_vkst.passes++; g_sub_pass++; g_pass_wmem = 0;
     for (int i = 0; i < 9; i++) { vkimg_t *a = P_att[i].im; if (a && a->rt_last != g_tex_frame + 1) { a->rt_frames = a->rt_last == g_tex_frame ? a->rt_frames + 1 : 1; a->rt_last = g_tex_frame + 1; } }   // (async_pipe)
     { extern uint64_t g_cmd_gen; g_cmd_gen++; }   // the bind cache starts empty in each pass: Adreno does not keep the state a pass's draws set for the next pass (XC3 drew its lighting black)
     if (g_x_tracepass == -2) { g_x_listpasses = 1; list_reads("before it, dispatches");
@@ -579,14 +591,21 @@ static void lin_back(void) {
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
-    if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) { vk_sync_pass_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
-void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) vk_ubd_land(vk_cmd()); }
+void vk_sync_end_at(const char *file, unsigned line) {
+    vk_sync_lifecycle(file,line,S.pass_open==2 && P_cleared ? 1:S.pass_open);
+    vk_end_pass();
+}
+void vk_sync_end_land_at(const char *file, unsigned line) {
+    vk_sync_end_at(file,line); if(vk_sub_open()) vk_ubd_land(vk_cmd());
+}
+void vk_end_pass_land(void) { vk_sync_end_at(__FILE__, __LINE__); if (vk_sub_open()) vk_ubd_land(vk_cmd()); }
 static int pass_whole(VkRect2D r) { return !r.offset.x && !r.offset.y && r.extent.width >= S.pass_w && r.extent.height >= S.pass_h; }
 static int begin_pass(void) {
     if (S.pass_open) return 1;
@@ -674,7 +693,7 @@ static int begin_pass(void) {
       for (int i = 0; i < ncol; i++) if (ca[i].imageView) { vkimg_t *im2; vk_tex_view(&S.rt_col[i], S.rt_has_cview[i] ? &S.rt_cview[i] : NULL, 0xff, 0, 1, &im2); cs[i] = im2 ? im2->samples : 0; if (cs[i] > 1) any = 1; if (!s0) s0 = cs[i]; else if (cs[i] != s0) mis = 1; }
       if (da.imageView) { vkimg_t *im2; vk_tex_view(&S.rt_dep, S.rt_has_dview ? &S.rt_dview : NULL, 0xff, 0, 1, &im2); cs[8] = im2 ? im2->samples : 0; if (cs[8] > 1) any = 1; if (s0 && cs[8] != s0) mis = 1; }
       if ((any || mis) && n < 10) { n++; VKLOG("pass %ux%u samples: colour %u %u %u %u, depth %u%s", w, h, cs[0], cs[1], cs[2], cs[3], cs[8], mis ? " MISMATCH" : ""); } }
-    if (!g_x_nobar) vk_img_barrier_all(cb);
+    if (!g_x_nobar) vk_sync_begin_barrier(cb);
     if (cut_touch) lrz_touch(dim, (g_lrz_touch & LRZ_CUT) != 0);   // (after the barrier: the earlier command buffer's depth writes come first)
     if (g_x_depth) { da.loadOp = sa.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; da.storeOp = sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; }
     if (g_x_color) for (int i = 0; i < ncol; i++) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -1608,7 +1627,7 @@ static int prepare_draw(int prim, int indexed) {
     // the change being tried applies to the found draw and every later one (the later draws are refused too: changing one draw alone proves nothing)
     int var = g_bis_trace >= 0 && g_draw_i >= g_bis_trace ? g_bis_var : 0; if (g_bis_var) g_tracing = 0;   // full logs only the first time
     g_var_now = 0;
-    if (var == 6) vk_end_pass();   // a new pass for this draw
+    if (var == 6) vk_sync_end_at(__FILE__, __LINE__);   // a new pass for this draw
     // A program may have no fragment stage (a depth-only draw: NVN binds by stage mask, and Metroid Dread draws about nine a frame so in its intro; nvn_mtl.m makes them vertex-only pipelines):
     // drawn with no fragment shader and no colour written (Vulkan leaves colour outputs undefined without one), as before only rasterizer-discard draws were
     if (!S.sh[0]) { g_vkst.skip_prog++; VKRED_ONCE(50, "draw with a program whose shaders are not in the bundle: skipped"); return 0; }
@@ -1629,7 +1648,7 @@ static int prepare_draw(int prim, int indexed) {
     // vertex shader drawing the pre-pass too changed nothing), and a full GPU wait after each submission, explicit barrier bits or a barrier to vertex input
     // did not help; drawing from a copy of the records did, as did a command buffer cut or a transfer read of the written buffer at either end of the run.
     // About +0.45 ms of GPU a frame, 33.2 ms frames held. DM_VK_RD_TOUCH=0 (live, A/B): no read
-    { static int prev; static uint64_t wa[16]; static int nwa; int rd = S.rast_discard; if (!g_x_rdkeep && rd != prev && S.pass_open) vk_end_pass();
+    { static int prev; static uint64_t wa[16]; static int nwa; int rd = S.rast_discard; if (!g_x_rdkeep && rd != prev && S.pass_open) vk_sync_end_at(__FILE__, __LINE__);
       if (rd) { if (!prev) nwa = 0; for (int r = 0; r < 16 && nwa < 16; r++) { uint64_t x = S.ssbo[0][r].addr; int have = 0; for (int i = 0; i < nwa; i++) have |= wa[i] == x; if (x && !have) wa[nwa++] = x; } }
       else if (prev && g_rd_touch && !S.pass_open) rd_read(wa, nwa);
       prev = rd; }
@@ -1642,7 +1661,7 @@ static int prepare_draw(int prim, int indexed) {
     // uniform updates stay deferred (the draws read their shadows), as at any cut. Only while vk_cmd_split can still begin a part: otherwise the pass would be cut for nothing
     if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)g_psplit && !S.rast_discard && (!S.daspect || g_psplit_depth)) {
         int vk_cmd_parts_left(void); if (vk_cmd_parts_left() > 0) { { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) after %llu draws, depth %d", g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, S.dfmt); }
-            vk_end_pass(); g_psplit_now = 1; } }
+            vk_sync_end_at(__FILE__, __LINE__); g_psplit_now = 1; } }
     else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !g_psplit_depth) { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) has depth (format %d): not split", g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt); }
     if (g_order_pending) { g_order_pending = 0; g_order_check = S.pass_open == 1; }   // an order-only barrier kept the pass open: decided below, once the draw's images are known
     if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
@@ -1729,7 +1748,7 @@ static int prepare_draw(int prim, int indexed) {
     if (g_order_check) {   // the order-only barrier before this draw (see g_order_keep): kept, or the pass ends here with it
         g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1];
         if (g_pass_wmem || shader_wmem(S.sh[0]) || shader_wmem(fs) || shader_wmem(S.sh[2]) || order_feedback(3)) {
-            g_order_ended++; vk_end_pass(); vk_img_barrier_all(vk_cmd());
+            g_order_ended++; vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd());
             if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
             cb = vk_cmd();
         } else g_order_kept++;
@@ -1753,6 +1772,19 @@ static int prepare_draw(int prim, int indexed) {
     if (g_ubolog_key && g_ubolog_n > 0 && S.sh[0] && S.sh[0]->key == g_ubolog_key) {   // DM_VK_UBO_LOG: the pipeline the draw got, and its key's hash
         uint64_t kh = fnv(1469598103934665603ull, &k, sizeof k); VKLOG("ubo: present %llu pipeline %p key %016llx um %llx/%llx im %llx/%llx", (unsigned long long)g_tex_frame, (void *)p, (unsigned long long)kh,
               (unsigned long long)k.um[0], (unsigned long long)k.um[1], (unsigned long long)k.im[0], (unsigned long long)k.im[1]); }
+    if(g_vk_sync_level>=2) {
+        uint64_t keys[3]={k.key[0],k.raster_discard ? 0:k.key[1],k.key[2]};
+        vkshader_t *gs=S.sh[2] ? vk_shader_gs_topo(S.sh[2],(VkPrimitiveTopology)k.topo):NULL;if(gs)keys[2]=gs->key;
+        vk_sync_pass_shader(keys,k.gs_split | k.raster_discard<<2 | k.fdz<<3 | k.dual<<4,k.topo);
+        for(int st=0;st<3;++st) if(S.sh[st] && !(st==1 && k.raster_discard)) {
+            for(int b=0;b<S.sh[st]->nbind;++b) {
+                const dmsv_bind *r=&S.sh[st]->b[b]; if(r->reg<0||r->reg>=16)continue;
+                const p_bind_buf *u=r->kind==RK_SBUF ? &S.ssbo[st][r->reg] : (r->kind==RK_CBUF||r->kind==RK_UBO_PTR) ? &S.ubo[st][r->reg]:NULL;
+                if(u && u->addr) { vkpool_t *pool=vk_pool_of(u->addr,1); vk_sync_pass_resource(pool ? pool->lo:0,pool ? u->addr-pool->lo:u->addr,u->size,1u<<st,r->kind==RK_SBUF ? 3:1,r->kind); }
+            }
+            for(int j=0;j<g_stn[st] && j<32;++j)vk_sync_pass_resource(g_stimg[st][j].pool,g_stimg[st][j].off,g_stimg[st][j].size,1u<<st,1,100);
+        }
+    }
     g_vkst.draws++; if (++g_pass_draws > g_vkst.max_pass_draws) g_vkst.max_pass_draws = g_pass_draws;
     if (p != S.bound_pipe) { uint64_t tb = g_prof_on ? tick() : 0; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; if (g_prof_on) g_prof_ns[4] += tick() - tb; }
     set_dynamic(cb);
@@ -1894,7 +1926,7 @@ static void tf_state(const p_tf_state *t) {
         g_tfc_cur = tf_ctl_slot(t->ctl, 1); g_tf_ctl[g_tfc_cur].ctl = t->ctl; g_tf_ctl[g_tfc_cur].ctr_ok = 0; g_tf_ctl[g_tfc_cur].gs = 0; break;
     case 3: g_tf_on = 1; g_tfc_cur = tf_ctl_slot(t->ctl, 1); if (g_tf_ctl[g_tfc_cur].ctl != t->ctl) { g_tf_ctl[g_tfc_cur].ctl = t->ctl; g_tf_ctl[g_tfc_cur].ctr_ok = 0; g_tf_ctl[g_tfc_cur].gs = 0; } break;   // Resume: on from the bytes written
     default: g_tf_on = 0;                                                // End / Pause: what was captured is read by later draws (as vertices), after the barrier the next pass begins with
-        if (g_tf_in_pass) { vk_end_pass(); g_tf_in_pass = 0; }
+        if (g_tf_in_pass) { vk_sync_end_at(__FILE__, __LINE__); g_tf_in_pass = 0; }
         int i = tf_ctl_slot(t->ctl, 1); g_tf_ctl[i].ctl = t->ctl; g_tf_ctl[i].verts = g_tf_verts;
         if (g_tf_ctl[i].gs && g_tf_ctl[i].dirty) {   // a counted capture: its bytes into the game's control buffer too (+0, one u32 a feedback buffer), for anything that reads it there
             VkBuffer b; VkDeviceSize o; g_tf_ctl[i].dirty = 0;
@@ -2049,10 +2081,11 @@ static void draw(const p_draw *d) {
     if (gs_split_draw(d->prim, d->ind, 0, 0)) {
         int discard = S.rast_discard;
         g_gs_split_mode = 1; S.rast_discard = 1; draw(d);
-        vk_end_pass(); vk_img_barrier_all(vk_cmd());
+        vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd());
+        vk_sync_gs_mark(vk_cmd(), !discard);
         S.rast_discard = discard;
         if (!discard) { g_gs_split_mode = 2; draw(d); }
-        g_gs_split_mode = 0; return;
+        g_gs_split_mode = 0; vk_sync_cancel(); return;
     }
     VkBuffer mcb = VK_NULL_HANDLE; VkDeviceSize mco = 0; if (mdi_group(d->mdi_cnt, d->ind, d->mdi_i, d->mdi_max, d->mdi_stride, 16, &mcb, &mco)) return;
     int prim = d->prim;
@@ -2103,10 +2136,11 @@ static void draw_idx(const p_draw_idx *d) {
     if (gs_split_draw(d->prim, d->ind, d->ibuf, index_bytes)) {
         int discard = S.rast_discard;
         g_gs_split_mode = 1; S.rast_discard = 1; draw_idx(d);
-        vk_end_pass(); vk_img_barrier_all(vk_cmd());
+        vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd());
+        vk_sync_gs_mark(vk_cmd(), !discard);
         S.rast_discard = discard;
         if (!discard) { g_gs_split_mode = 2; draw_idx(d); }
-        g_gs_split_mode = 0; return;
+        g_gs_split_mode = 0; vk_sync_cancel(); return;
     }
     VkBuffer mcb = VK_NULL_HANDLE; VkDeviceSize mco = 0; if (mdi_group(d->mdi_cnt, d->ind, d->mdi_i, d->mdi_max, d->mdi_stride, 20, &mcb, &mco)) return;
     int prim = d->prim;
@@ -2220,7 +2254,7 @@ static void dispatch(const p_dispatch *d) {
     VkBuffer src[3]; VkBufferCopy spans[3]; int nspans = 0;
     if (d->ind && !(nspans = dispatch_indirect_spans(d->ind, src, spans))) { VKRED_ONCE(61, "indirect dispatch arguments are not a valid aligned memory pool range: %#llx", (unsigned long long)d->ind); return; }
     g_vkst.dispatches++;
-    vk_end_pass_land();
+    vk_sync_end_land_at(__FILE__, __LINE__);
     VkCommandBuffer cb = vk_cmd();
     VkDescriptorSetLayout dsl[5] = {cs->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
     // the group counts before the descriptors: the driver segment stage_set builds carries them at c0 + 0x200 (drv_segment), as nvn_mtl.m's does. Set after it, every
@@ -2239,6 +2273,7 @@ static void dispatch(const p_dispatch *d) {
     }
     if (p == (void *)1) return;
     vk_img_barrier_all(cb);
+    if(g_vk_sync_level>=2){vk_sync_pass pmeta;memset(&pmeta,0,sizeof pmeta);pmeta.w=d->x;pmeta.h=d->y;vk_sync_pass_begin(&pmeta);uint64_t keys[3]={0,0,cs->key};vk_sync_pass_shader(keys,0x100,(uint32_t)d->z);for(int r=0;r<16;++r)if(S.ssbo[5][r].addr){uint64_t a=S.ssbo[5][r].addr;vkpool_t *pool=vk_pool_of(a,1);vk_sync_pass_resource(pool?pool->lo:0,pool?a-pool->lo:a,S.ssbo[5][r].size,32,3,RK_SBUF);}}
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)cs->ndyn, dofs);
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);   // DM_VK_PASS_TIMES: dispatches are timed as passes
@@ -2252,7 +2287,7 @@ static void dispatch(const p_dispatch *d) {
         vkCmdDispatchIndirect(cb, b, o);   // the same snapshot supplies both the dispatch and the shader's group counts
     }
     else vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
-    vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);
+    vk_sync_dispatch_end(); vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);
     if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
     if (crumbs_on()) { crumb_t *c = crumb_cur(); if (c->n < 8) { c->k[c->n][0] = 0; c->k[c->n][1] = 0; c->k[c->n][2] = cs->key; c->n++; } crumb_mark(1); }
     if (g_x_tracepass == -2 || mdi_log_now()) {   // (DM_VK_TRACE_PASS=-2 lists the dispatches too, with their storage buffers: the addresses for a DM_CTL memdump)
@@ -2268,7 +2303,7 @@ static VkImageSubresourceLayers sub_of(vkimg_t *im, const view_t *v, int has_v, 
     return (VkImageSubresourceLayers){im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT), lv, ly + (layered ? (uint32_t)z : 0), 1};
 }
 static void copy_b2t(const p_copy_b2t *c, int to_texture) {
-    vk_end_pass_land();
+    vk_sync_end_land_at(__FILE__, __LINE__);
     vkimg_t *im = vk_tex(c->tex); const vkfmt_t *f = vk_fmt(c->tex->d.format);
     if (!im || !f) return;
     VkBuffer b; VkDeviceSize o;
@@ -2357,7 +2392,7 @@ static int depth_scale(VkCommandBuffer cb, vkimg_t *s, vkimg_t *d, VkImageSubres
     return 1;
 }
 static void copy_t2t(const p_copy_t2t *c) {
-    vk_end_pass();
+    vk_sync_end_at(__FILE__, __LINE__);
     vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
     if (!s || !d) return;
     vk_watch(s, "copy source"); vk_watch(d, "copy destination");
@@ -2402,7 +2437,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     vk_img_barrier_all(cb);
 }
 static void clear_tex(const p_clear_tex *c) {
-    vk_end_pass();
+    vk_sync_end_at(__FILE__, __LINE__);
     vkimg_t *im = vk_tex(c->tex); if (!im) return;
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb); im->gpu_w = 1;
     VkImageSubresourceLayers l = sub_of(im, &c->view, c->has_view, c->r.zoffset);
@@ -2433,7 +2468,7 @@ static void set_rt(const p_set_rt *r) {
         const tex_t *d = r->depth; VKLOG("--- set targets:%s depth %s#%llu@%p%s", t, d && d->magic == MAGIC('T', 'E', 'X', 0) ? "" : "(none) ", d ? (unsigned long long)d->serial : 0ull, d ? (void *)d->mem : NULL,
                                          S.pass_open && !g_x_nokeep && rt_same(r) ? " (the same: the pass goes on)" : ""); }
     if (S.pass_open && !g_x_nokeep && rt_same(r)) { g_vkst.rt_kept++; return; }   // the same targets again (Unity sets them before many draws): the pass goes on
-    vk_end_pass();
+    vk_sync_end_at(__FILE__, __LINE__);
     S.rt_n = r->n > 8 ? 8 : r->n;
     for (int i = 0; i < S.rt_n; i++) {
         S.rt_has_col[i] = r->color[i] != NULL && r->color[i]->magic == MAGIC('T', 'E', 'X', 0); if (S.rt_has_col[i]) S.rt_col[i] = *r->color[i];
@@ -2568,7 +2603,7 @@ static void exec_ops(const uint8_t *p) {
             int32_t bits = *(const int32_t *)a;
             if (g_x_listpasses) VKLOG("    barrier %#x%s", bits, g_order_keep && S.pass_open == 1 && !(bits & ~0x7) ? " (order only: decided at the next draw)" : "");
             if (g_order_keep && S.pass_open == 1 && !(bits & ~0x7)) { g_order_pending = 1; break; }   // (g_order_keep)
-            vk_end_pass(); vk_img_barrier_all(vk_cmd()); g_order_pending = 0; break; }
+            vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd()); g_order_pending = 0; break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: {   // bound handles were rebased when recorded (hle_nvn.c bind_handles); handles read from memory are rebased by these (mem_handle)
             const p_set_pool *sp = (const p_set_pool *)a; int base = sp->pool ? nvn_dpool_base(sp->pool, h.op == OP_SET_TEX_POOL) : 0;
             if (h.op == OP_SET_TEX_POOL) g_pool_tex_base = base; else g_pool_samp_base = base;

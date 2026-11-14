@@ -57,6 +57,7 @@ static void state_reset(void) {
 }
 static void prewarm_start(void); static void compute_warm_start(void); static void build_dump(void);
 static uint64_t g_set_epoch = 1;   // the submission the descriptor set cache belongs to (stage_set)
+static void vbuf_join_trim(void);
 static int32_t g_pass_bb[4];   // bounding box of the scissors the open pass's draws used (x0 y0 x1 y1)
 static int g_cb_draws;   // draws in the command buffer being recorded (vk_cmd_split after DM_VK_CB_DRAWS draws, 0 = never)
 static int g_psplit, g_psplit_depth, g_psplit_now, g_ord_parts, g_setsplit;   // DM_VK_PASS_SPLIT / _DEPTH (prepare_draw); g_psplit_now: the pass being begun goes on with the one just ended (begin_pass cuts before it);
@@ -227,6 +228,8 @@ void vk_exec_reset(void) {   // a new submission: NVN state does not carry over 
     static int inited; if (!inited) { inited = 1; state_reset(); crash_add_note_hook(build_dump); prewarm_start(); compute_warm_start(); }
     g_rc_npend = 0; g_rc_skip = 0;
     { void vk_tex_release_drain(void); vk_tex_release_drain(); }   // Finalized textures' CPU-written marks that no queued job needs any more (gfx_vk_tex.c)
+    { void vk_tex_evict_idle(void); vk_tex_evict_idle(); }   // after a sweep: the images of textures not looked up lately go (gfx_vk_tex.c)
+    vbuf_join_trim();   // the copies of vertex buffers across a chunk's end not bound lately
     if (g_gsb.n) { VKRED_ONCE(113, "a submission ended with %d batched rasterization draws not drawn", g_gsb.n); g_gsb.n = 0; }   // (every pass end draws them: not expected)
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
@@ -1330,6 +1333,51 @@ static void vk_cross(int k, uint64_t a, uint64_t n, const vkpool_t *p) {
     uint64_t c = ++g_cross[k]; if (!(c & (c - 1))) VKLOG("%s%llu %s across a memory pool chunk's end (this one %#llx +%#llx, the chunk ends at %#llx)", k == 1 || k == 3 ? "[RED] " : "", (unsigned long long)c, what[k],
                                                            (unsigned long long)a, (unsigned long long)n, (unsigned long long)p->hi);
 }
+// A vertex buffer bound across a chunk's end: the draw reads it from a copy of the bound range, put together from the chunks' buffers by GPU copies in the upload command
+// buffer (which runs before this submission's draws: it holds what the CPU and earlier submissions wrote, not what this submission's own passes write there). Bound from
+// its first chunk, the vertices past the chunk's end were read past the buffer: NieR:Automata's 1.3 GB pool (6 chunks of 256 MB) holds meshes of the city's distant ground
+// at 0x761ff09fd0 +1.1 MB and 0x761fab5d50 +16 MB across the first chunk's end, and from the tower on its edge the ground was black with the far buildings standing in it
+// (no NaN in any pass), or a building stretched into slabs; where the meshes land differs from load to load, so it came and went.
+// One copy per address per submission, of the longest range bound there so far (the game binds one address with a length that differs from draw to draw: +0xf8d5c to
+// +0x11ba30 at the first; a copy per bound range took the scratch memory of every draw, and the system killed the app for its memory twice on a Xiaomi Pad 7). The copy
+// goes into a buffer of the address's own, kept from submission to submission: in scratch memory each submission in flight held one (6 x 19 MB, the scratch at 162 MB
+// instead of 48). A barrier before the copy waits for the earlier submissions' draws that read the buffer. A buffer not used for VJ_IDLE submissions goes (vbuf_join_trim).
+// DM_VK_VBUF_JOIN=0 (live): bound from the first chunk as before
+enum { VJ_N = 16, VJ_IDLE = 600 };
+static struct { uint64_t a, n, most, cap, ep; VkBuffer b; VkDeviceMemory m; } g_vj[VJ_N];   // most: the longest range bound at a; cap: the buffer's size; ep: the submission it was last filled in
+uint64_t g_vjoin_n, g_vjoin_bytes, g_vjoin_live;   // copies made and their bytes, the buffers' bytes now (gfx_vk_present.c's line every 600 presents)
+static void vj_free(int k) {
+    if (g_vj[k].b) { vk_defer_free_buffer(g_vj[k].b, g_vj[k].m); g_vjoin_live -= g_vj[k].cap; }
+    memset(&g_vj[k], 0, sizeof g_vj[k]);
+}
+static void vbuf_join_trim(void) { for (int k = 0; k < VJ_N; k++) if (g_vj[k].b && g_set_epoch - g_vj[k].ep > VJ_IDLE) vj_free(k); }
+static void vbuf_joined(uint64_t a, uint64_t n, const vkpool_t *p, VkBuffer *buf, VkDeviceSize *off) {
+    { const char *e = getenv("DM_VK_VBUF_JOIN"); if (e && !atoi(e)) return; }
+    if (a + n > p->end) n = p->end - a;
+    int k = -1; for (int i = 0; i < VJ_N; i++) if (g_vj[i].a == a && g_vj[i].b) { k = i; break; }
+    if (k < 0) { k = 0; for (int i = 1; i < VJ_N; i++) if (g_vj[i].ep < g_vj[k].ep) k = i; vj_free(k); g_vj[k].a = a; }   // (the entry used the longest ago)
+    if (g_vj[k].b && g_vj[k].ep == g_set_epoch && g_vj[k].n >= n) { *buf = g_vj[k].b; *off = 0; return; }
+    if (n < g_vj[k].most) n = g_vj[k].most; else g_vj[k].most = n;
+    if (g_vj[k].cap < n) {   // (a larger range: a larger buffer, the old one freed after the submissions that read it)
+        uint64_t most = g_vj[k].most; vj_free(k); g_vj[k].a = a; g_vj[k].most = most;
+        VkDeviceSize cap = (n + 0xfffff) & ~(VkDeviceSize)0xfffff;
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, cap, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        if (vkCreateBuffer(V.dev, &bi, NULL, &g_vj[k].b)) { g_vj[k].b = VK_NULL_HANDLE; VKRED_ONCE(121, "vertex buffer across a memory pool chunk's end: no buffer for its copy"); return; }
+        VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, g_vj[k].b, &req);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+        if (vkAllocateMemory(V.dev, &ai, NULL, &g_vj[k].m)) { vkDestroyBuffer(V.dev, g_vj[k].b, NULL); g_vj[k].b = VK_NULL_HANDLE; VKRED_ONCE(122, "vertex buffer across a memory pool chunk's end: no memory for its copy"); return; }
+        VKCHK(vkBindBufferMemory(V.dev, g_vj[k].b, g_vj[k].m, 0)); g_vj[k].cap = cap; g_vjoin_live += cap;
+    }
+    VkCommandBuffer cb = vk_upload_cmd();
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};   // after every read of it so far
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    for (uint64_t x = a; x < a + n;) {
+        vkpool_t *q = vk_pool_of(x, 1); if (!q) { VKRED_ONCE(120, "vertex buffer across a memory pool chunk's end: no chunk at %#llx", (unsigned long long)x); return; }
+        uint64_t e = q->hi < a + n ? q->hi : a + n; VkBufferCopy r = {x - q->lo + q->boff, x - a, e - x};
+        vkCmdCopyBuffer(cb, q->buf, g_vj[k].b, 1, &r); x = e;
+    }
+    g_vj[k].n = n; g_vj[k].ep = g_set_epoch; *buf = g_vj[k].b; *off = 0; g_vjoin_n++; g_vjoin_bytes += n;
+}
 // a constant buffer binding's descriptor (stage_set, set_memo_get): its pool's buffer from the alignment boundary below it, or the shadow of the deferred updates over it
 static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
     const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
@@ -1867,7 +1915,8 @@ static int prepare_draw(int prim, int indexed) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;
         if (b == 16) { buf = vk_zero_buffer(); off = 0; }
         else if (!vk_buf_at(S.vbuf[b].address, 1, &buf, &off)) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
-        else if (S.vbuf[b].size) { vkpool_t *vp = vk_pool_of(S.vbuf[b].address, 1); if (vp && S.vbuf[b].address + S.vbuf[b].size > vp->hi && vp->hi < vp->end) vk_cross(2, S.vbuf[b].address, S.vbuf[b].size, vp); }
+        else if (S.vbuf[b].size) { vkpool_t *vp = vk_pool_of(S.vbuf[b].address, 1); if (vp && S.vbuf[b].address + S.vbuf[b].size > vp->hi && vp->hi < vp->end) {
+            vk_cross(2, S.vbuf[b].address, S.vbuf[b].size, vp); vbuf_joined(S.vbuf[b].address, S.vbuf[b].size, vp, &buf, &off); } }
         if (g_var_now == 5) { buf = vk_zero_buffer(); off = 0; }
         if (!(dbg_draw() & 2) && b < 17) bc_vbuf(cb, b, buf, off);
     }

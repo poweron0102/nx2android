@@ -227,7 +227,7 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
         VKRED_ONCE(96, "compressed image format %#x refused colour-attachment usage (%d): created without it", d->format, r);
         ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; im->usage = ci.usage; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
     if (r) { VKRED_ONCE(10, "vkCreateImage failed (%d): %ux%ux%u format %#x (vk %d) target %d levels %u layers %u samples %u", r, im->w, im->h, im->d, d->format, f->vk, d->target, im->levels, im->layers, im->samples); free(im); return NULL; }
-    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req); im->vk_bytes = req.size;
     if ((ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) && im->w >= 256) { static int n; if (n++ < 16)   // UBWC check: a compressed target takes room for its metadata
         VKLOG("target %ux%u format %d%s: %llu bytes", im->w, im->h, f->vk, im->fixed_fmt ? " (format-listed)" : "", (unsigned long long)req.size); }
     VkDeviceSize moff;
@@ -262,7 +262,7 @@ int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t n
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n);
 static int sparse_tex(const tex_t *t) { return t->pool && nvn_sparse_pool(t->pool); }
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
-static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
+static uint64_t pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte words
     uint64_t h = 1469598103934665603ull; size_t i = 0;
     for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, m + i, 8); h = (h ^ w) * 1099511628211ull; }
@@ -271,50 +271,109 @@ static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte w
 }
 static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
-    pkg_upload_(im, t, f);
-    clock_gettime(CLOCK_MONOTONIC, &b); g_pkg_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); g_pkg_n++; g_pkg_bytes += t->L.size;
+    uint64_t n = pkg_upload_(im, t, f);
+    clock_gettime(CLOCK_MONOTONIC, &b); g_pkg_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); if (n) { g_pkg_n++; g_pkg_bytes += n; }
 }
-static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
-    { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 60) { n++;   // which packaged textures are (re-)uploaded
-        VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d%s",
-              (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
-              (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
+// Each level and layer's storage in a block-linear texture (rg[level * layers + layer]): from its start to the next level's in the layer, the last level's to the layer's end,
+// as nvn_deswizzle_geom places them. The level offsets are found once: through nvn_deswizzle_geom for every level and layer (each a layout and a walk over the levels),
+// the 16x16x768 cube array of 5 levels NieR:Automata writes during loads cost about 15 ms an upload, and loads froze for about a second a frame. 0 = found
+static int pkg_sub_ranges(const tex_t *t, unsigned levels, unsigned layers, uint64_t (*rg)[2]) {
+    uint32_t rb, rows, sl, bpb; uint64_t b; unsigned th, td, dl = t->d.levels ? t->d.levels : 1;
+    nvn_texlayout L; nvn_tex_layout(&t->d, &L);
+    if (levels > dl || layers > L.layers || levels > 32 || nvn_deswizzle_geom(&t->d, 0, 0, &rb, &rows, &sl, &b, &th, &td, &bpb)) return -1;   // (a layout the deswizzler refuses)
+    uint64_t off[33];
+    for (unsigned lv = 0; lv <= levels && lv < dl; lv++) off[lv] = nvn_tex_level_offset(&t->d, lv);
+    for (unsigned lv = 0; lv < levels; lv++)
+        for (unsigned ly = 0; ly < layers; ly++) {
+            uint64_t lo = (uint64_t)ly * L.layer_size + off[lv], hi = lv + 1 < dl ? (uint64_t)ly * L.layer_size + off[lv + 1] : (uint64_t)(ly + 1) * L.layer_size;
+            if (hi > t->L.size) hi = t->L.size;
+            if (lo >= hi) return -1;
+            rg[lv * layers + ly][0] = lo; rg[lv * layers + ly][1] = hi;
+        }
+    return 0;
+}
+// DM_VK_PKG_NANCHECK=1 (live): the NaN and infinite values in each level and layer of a 16- or 32-bit float texture as it goes up (a scene lit from a texture holding them
+// comes out black, and the bloom spreads them: NieR:Automata's city)
+static void pkg_nan_check(const tex_t *t, const vkfmt_t *f, unsigned lv, unsigned ly, const uint8_t *p, size_t n) {
+    const char *e = getenv("DM_VK_PKG_NANCHECK"); if (!e || !atoi(e)) return;
+    static int nl; if (nl >= 200) return;
+    uint64_t bad = 0, first = ~0ull;
+    if (f->vk == VK_FORMAT_R16G16B16A16_SFLOAT) { for (size_t i = 0; i + 2 <= n; i += 2) { uint16_t h; memcpy(&h, p + i, 2); if ((h & 0x7c00) == 0x7c00) { bad++; if (first == ~0ull) first = i; } } }
+    else for (size_t i = 0; i + 4 <= n; i += 4) { uint32_t w; memcpy(&w, p + i, 4); if ((w & 0x7f800000) == 0x7f800000) { bad++; if (first == ~0ull) first = i; } }
+    if (bad) { nl++; VKLOG("[RED] texture %ux%ux%u nvn format %#x at %p: level %u layer %u goes up with %llu NaN or infinite values (first at byte %llu of %zu)", t->d.width, t->d.height, t->d.depth,
+                          t->d.format, (const void *)t->mem, lv, ly, (unsigned long long)bad, (unsigned long long)first, n); }
+}
+// Returns the guest bytes uploaded
+static uint64_t pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     if (im->packaged < 100) im->packaged++;
-    VkCommandBuffer cb = vk_upload_cmd();
-    if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     const uint8_t *mem = t->mem; uint8_t *copy = NULL;
+    int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
+    unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
+    if (!bpb) { VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return 0; }
+    // Uploaded again, only the levels and layers whose pages were written since the last upload go up (an untracked texture counts as written everywhere, and the idle
+    // sweep's release stamps every page): the game's small WriteTexels regions (hle_nvn.c write_region_bl) made the whole of a 512x512x16 2D array go up again. The bytes of
+    // a level and layer are hashed only when it goes up; hashed whole, the 32 MB array alone took about 7 ms. A texture whose levels and layers cannot be told apart (a sparse
+    // or linear one, a layout the deswizzler refuses) has one entry, for all of it
+    unsigned nsub = im->levels * im->layers, nh = nsub; uint64_t (*rg)[2] = NULL;
+    if (im->pkg_sparse || linear || sparse_tex(t) || !(rg = malloc(sizeof *rg * nsub))) nh = 1;
+    if (rg && pkg_sub_ranges(t, im->levels, im->layers, rg)) { free(rg); rg = NULL; nh = 1; }
+    int part = im->pkg_subh && im->pkg_nsub == nh && im->pkg_mem == t->mem && !sparse_tex(t);   // uploaded before from the same storage: only what was written goes up
+    { const char *e = getenv("DM_VK_PKG_WHOLE"); if (e && atoi(e)) part = 0; }   // A/B (live): a texture uploaded again goes up whole, as before
+    uint64_t was = im->pkg_stamp;
+    if (!part) { free(im->pkg_subh); im->pkg_subh = calloc(nh, sizeof *im->pkg_subh); im->pkg_nsub = im->pkg_subh ? nh : 0; }
     if ((im->pkg_sparse = sparse_tex(t))) {   // through the page table (see above); its physical pages stay protected, so no sweep releases them (pkg_mem NULL)
         im->pkg_vgen = nvn_sparse_gen(); nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_seen = im->pkg_stamp;
         im->pkg_span = NULL; im->pkg_mem = NULL; im->pkg_len = 0; im->pkg_released = 0;
-        if (!(copy = malloc(t->L.size))) return;
+        if (!(copy = malloc(t->L.size))) { free(rg); return 0; }
         uint64_t miss = nvn_sparse_copy(t->pool, copy, (uint64_t)(uintptr_t)t->mem, t->L.size); mem = copy;
         { static int n; const char *e = getenv("DM_VK_LOG_SPARSE"); if (e && atoi(e) && n < 400) { n++;   // which sparse textures are read, and how much of them was not mapped yet
             VKLOG("sparse upload: serial %llu %ux%ux%u format %#x levels %u flags %#x size %#llx mem %p pool %p tileH %u: %#llx bytes not mapped%s", (unsigned long long)t->serial, t->d.width, t->d.height,
                   t->d.depth, t->d.format, im->levels, t->d.flags, (unsigned long long)t->L.size, (const void *)t->mem, t->pool, t->L.tileH, (unsigned long long)miss, im->packaged > 1 ? " (again)" : ""); } }
-    } else {
+    } else {   // protected again first, then stamped: a write from here on is a newer generation, and one before is in the bytes read below
         nvn_dirty_protect(t->mem, t->L.size);
         im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
-        im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0; im->pkg_hash = pkg_hash(t->mem, t->L.size);
+        im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0;
     }
-    int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
-    unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
-    if (!bpb) { free(copy); VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return; }
-    for (unsigned lv = 0; lv < im->levels; lv++) {
+    // Which levels and layers go up: written since the upload, and then with bytes that differ from it if the GPU wrote the image since (pages written around a texture
+    // with its own bytes unchanged keep what the GPU wrote: Monster Hunter Rise's spot light profiles, 512x1x64 R16F written by a compute shader into memory the game had
+    // zeroed, were uploaded again as zeros at presents 60 and 1079, and every face lit only by those lights came out black). A sparse texture is read whole again
+    uint8_t *up = calloc(nh, 1); if (!up) { free(rg); free(copy); return 0; }
+    unsigned nup = 0, kept = 0;
+    for (unsigned i = 0; i < nh; i++) {
+        uint64_t lo = rg ? rg[i][0] : 0, hi = rg ? rg[i][1] : t->L.size;
+        if (part && !nvn_dirty_since_span(im->pkg_span, t->mem + lo, hi - lo, was)) continue;
+        if (!im->pkg_sparse) { uint64_t h = pkg_hash(t->mem + lo, hi - lo); if (part && im->gpu_w && h == im->pkg_subh[i]) { kept++; continue; } if (im->pkg_subh) im->pkg_subh[i] = h; }
+        up[i] = 1; nup++;
+    }
+    if (kept) { static int nl; if (nl++ < 16) VKLOG("texture %ux%u nvn format %#x at %p: %u of its %u levels and layers had pages written with their bytes as uploaded, and the GPU wrote it: kept",
+                                                   t->d.width, t->d.height, t->d.format, (const void *)t->mem, kept, nh); }
+    { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); int lv = e ? atoi(e) : 0; if (lv && nup && (lv != 2 || part) && n < 60) { n++;   // which packaged textures are (re-)uploaded; 2: only those uploaded again
+        VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d: %u of %u levels and layers%s",
+              (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
+              (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, nup, nh, im->packaged > 1 ? " (again)" : ""); } }
+    uint64_t bytes = 0; VkCommandBuffer cb = nup ? vk_upload_cmd() : VK_NULL_HANDLE;
+    if (cb && im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
+    for (unsigned lv = 0; cb && lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = im->d >> lv ? im->d >> lv : 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, slab = pitch * by * z;
         for (unsigned ly = 0; ly < im->layers; ly++) {
+            unsigned i = nh == 1 ? 0 : lv * im->layers + ly; if (!up[i]) continue;
+            if (nh > 1) bytes += rg[i][1] - rg[i][0];
             VkBuffer sb; VkDeviceSize so; uint8_t *blocks = f->dec ? malloc(slab) : NULL, *dst = blocks ? blocks : vk_scratch(slab, 16, &sb, &so);
-            if (f->dec && !blocks) { free(copy); return; }
+            if (f->dec && !blocks) { free(up); free(rg); free(copy); return bytes; }
             if (linear) {   // linear storage: rows of the texture's stride, one level, one layer
                 size_t stride = t->d.stride ? t->d.stride : pitch;
                 for (uint32_t y = 0; y < by * z; y++) memcpy(dst + y * pitch, mem + (size_t)y * stride, pitch);
-            } else if (nvn_deswizzle(&t->d, lv, ly, mem, dst, pitch)) { free(blocks); free(copy); VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return; }
+            } else if (nvn_deswizzle(&t->d, lv, ly, mem, dst, pitch)) { free(blocks); free(up); free(rg); free(copy); VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return bytes; }
             if (blocks) { dst = vk_scratch((size_t)w * h * z * f->dbpp, 16, &sb, &so); bc_decode(f, blocks, pitch, w, h, z, dst); free(blocks); }   // (BC the device lacks)
             VkBufferImageCopy r = {so, 0, 0, {im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+            if (f->vk == VK_FORMAT_R16G16B16A16_SFLOAT || f->vk == VK_FORMAT_R32G32B32A32_SFLOAT) pkg_nan_check(t, f, lv, ly, dst, slab);
         }
     }
-    free(copy);
+    if (nh == 1 && nup) bytes = t->L.size;
+    free(up); free(rg); free(copy);
+    return bytes;
 }
 static int packaged_tex(const tex_t *t);
 static int cpu_content_tex(const tex_t *t, const vkfmt_t *f);
@@ -349,7 +408,7 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static void img_drop(vkimg_t *im) { vk_lrz_forget(im); free(im->pkg_subh); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -357,6 +416,52 @@ static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
         memcpy(&ks[n++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof(akey));
     }
     for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
+}
+// Idle textures. An image filled from guest memory (packaged) is a second copy of bytes the game's pool still holds, and it was kept until its pool went: NieR:Automata keeps
+// one 1.3 GB pool for good and streams its field through it, so the images only grew while walking (179 MB of them a minute into its desert, 359 MB after five on a Xiaomi
+// Pad 7, 128 MB not looked up for 1800 presents), until an 8 GB tablet swapped. Two rules drop them, each at the first submission after a sweep (every 300 presents):
+//   DM_VK_TEX_IDLE=<presents> (default PKG_IDLE, 0 turns it off): those not looked up for that long. At PKG_IDLE a texture has given up its write protection already
+//   (vk_tex_sweep), so its next use uploads it again anyway; the image going with it costs that use only the image's creation.
+//   DM_VK_TEX_CACHE_MB=<n> (default 0, no limit): while the driver's memory for these images is over n MB, the least recently looked up go as well, down to those of the
+//   last EVICT_KEEP presents (the frame's own are never dropped, so a scene that needs more than the budget keeps what it draws).
+// Only what the storage can give back goes: not an image the GPU wrote (a render target, a compute shader's or a copy's destination: gpu_w), whose content is nowhere else.
+// A dropped image's key is remembered (g_refill) so that the image made for it again is filled from its storage at its first use whatever texture object asks: the object that
+// made it CPU-written may be gone, and one made over the same storage since would have found the old image with its texels. Both switches are read at each sweep (live).
+// Runs on the replay thread with a submission open (vk_exec_reset), as evict_overlaps does: outside one, each deferred free would wait for the GPU (df_add)
+enum { TEX_IDLE = 1800 };   // PKG_IDLE (below)
+static nvn_hmap g_refill = {.klen = sizeof(akey)};   // akey → 1 (under g_img_mu)
+static uint64_t g_idle_n, g_idle_bytes, g_idle_back;   // images the idle sweep dropped and their driver memory, and how many were made again (the images line)
+static _Atomic int g_idle_due;
+typedef struct { uint64_t used, bytes; akey k; } idle_ent;
+static int idle_cmp(const void *a, const void *b) { uint64_t x = ((const idle_ent *)a)->used, y = ((const idle_ent *)b)->used; return x < y ? -1 : x > y; }
+static int64_t env_i64(const char *name, int64_t dflt) { const char *e = getenv(name); return e && *e ? atoll(e) : dflt; }
+static int idle_storage_backed(const vkimg_t *im) { return im->packaged && !im->gpu_w && !im->rt_last && !im->lin_mem; }
+void vk_tex_evict_idle(void) {
+    if (!atomic_exchange(&g_idle_due, 0)) return;
+    int64_t idle = env_i64("DM_VK_TEX_IDLE", TEX_IDLE), cap = env_i64("DM_VK_TEX_CACHE_MB", 0) << 20;
+    if (idle > 0 && idle < EVICT_KEEP) idle = EVICT_KEEP;
+    if (idle <= 0 && cap <= 0) return;
+    idle_ent *v = NULL; size_t nv = 0, vcap = 0; uint64_t total = 0, n = 0, bytes = 0;
+    pthread_mutex_lock(&g_img_mu);
+    for (uint32_t i = 0; i < g_by_key.cap; i++) {
+        vkimg_t *im = g_by_key.vals[i]; if (!im || !idle_storage_backed(im)) continue;
+        total += im->vk_bytes;
+        if (g_tex_frame - im->used < EVICT_KEEP) continue;
+        if (nv == vcap) { vcap = vcap ? vcap * 2 : 1024; idle_ent *nw = realloc(v, vcap * sizeof *v); if (!nw) break; v = nw; }
+        v[nv].used = im->used; v[nv].bytes = im->vk_bytes; memcpy(&v[nv].k, g_by_key.keys + (size_t)i * g_by_key.klen, sizeof(akey)); nv++;
+    }
+    if (nv) qsort(v, nv, sizeof *v, idle_cmp);
+    if (g_refill.n > 65536) { free(g_refill.keys); free(g_refill.vals); nvn_hm_init(&g_refill, sizeof(akey)); }   // (keys never asked for again: their pool lives on)
+    for (size_t i = 0; i < nv; i++) {   // the least recently looked up first
+        if (!((idle > 0 && g_tex_frame - v[i].used >= (uint64_t)idle) || (cap > 0 && total > (uint64_t)cap))) break;
+        vkimg_t *im = nvn_hm_del(&g_by_key, &v[i].k); if (!im) continue;
+        img_drop(im); nvn_hm_put(&g_refill, &v[i].k, (void *)1); total -= v[i].bytes; n++; bytes += v[i].bytes;
+    }
+    g_idle_n += n; g_idle_bytes += bytes;
+    pthread_mutex_unlock(&g_img_mu);
+    free(v);
+    static int nl; if (n && nl < 12) { nl++; VKLOG("textures: %llu not looked up lately dropped (%.1f MB of image memory; idle limit %lld presents, budget %lld MB), %.1f MB of them left",
+        (unsigned long long)n, bytes / 1048576.0, (long long)idle, (long long)(cap >> 20), total / 1048576.0); }
 }
 static vkimg_t *vk_tex_(const tex_t *t);
 vkimg_t *vk_tex(const tex_t *t) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
@@ -380,6 +485,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         im = img_new(t, f); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size;
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
+        if (keyed && g_refill.n && nvn_hm_del(&g_refill, &k)) { im->refill = 1; g_idle_back++; }   // the idle sweep dropped its image: from its storage again
     }
     im->used = g_tex_frame;
     pthread_mutex_unlock(&g_img_mu);
@@ -389,21 +495,14 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
     if (t->mem && lin_copy(im, t, f)) {}
-    else if (t->mem && (packaged_tex(t) || (first && (nvn_ft_written(t) || cpu_content_tex(t, f))))) {
+    else if (t->mem && (packaged_tex(t) || (first && (im->refill || nvn_ft_written(t) || cpu_content_tex(t, f))))) {
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
         else {
             uint64_t now = nvn_dirty_now();
             if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
-            else if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) {   // pages written since the upload
-                // The GPU wrote the image since (a compute shader's image stores, a copy, a render) and its storage still holds the bytes of the upload: the writes were around
-                // it on shared pages, and an upload would put the CPU's bytes over the GPU's. Monster Hunter Rise's spot light profiles (512x1x64 R16F, written by a compute
-                // shader into memory the game had zeroed) were uploaded again as zeros at presents 60 and 1079: every spot light's profile read 0 and the faces lit only by
-                // those lights (the character maker, cutscenes) came out black. A sparse texture has no memory at t->mem to hash (it takes the branch above)
-                if (im->gpu_w && pkg_hash(t->mem, t->L.size) == im->pkg_hash) { nvn_dirty_protect(t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_released = 0;
-                    static int nl; if (nl++ < 16) VKLOG("texture %ux%u nvn format %#x at %p: its pages were written, its bytes are as uploaded and the GPU wrote it: kept", t->d.width, t->d.height, t->d.format, (const void *)t->mem); }
-                else pkg_upload(im, t, f);
-            }
+            else if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) pkg_upload(im, t, f);   // pages written since the upload: the
+                // levels and layers written go up (pkg_upload_; with their bytes as uploaded, an image the GPU wrote since keeps them)
             im->pkg_seen = now;
         }
     } else if (first) vk_tex_prepare(vk_upload_cmd(), im);
@@ -415,14 +514,84 @@ static vkimg_t *vk_tex_(const tex_t *t) {
 // protection has split most mapped again in one piece (nvn_dirty_defrag: Xenoblade Chronicles 3 went from 43,000 mappings after 25 minutes of walking, toward the kernel's
 // limit of 65,530, to about 17,500)
 enum { PKG_IDLE = 1800, PKG_KEEP = 60, PKG_RUNS = 8000 };   // about 60 s and 2 s at 30 fps; at most about 16,000 mappings for the protection
+_Static_assert(TEX_IDLE == PKG_IDLE, "the idle sweep drops an image when its write protection goes");
 uint64_t g_tex_frame;
 typedef struct { uint64_t used; vkimg_t *im; } pkg_age;
 static int pkg_age_cmp(const void *a, const void *b) { uint64_t x = ((const pkg_age *)a)->used, y = ((const pkg_age *)b)->used; return x < y ? -1 : x > y; }
+// DM_VK_MEM_LOG=1 (live): every 900 presents, where the backend's memory is. Four lines:
+//   texture formats: the textures (not render targets) by how their format is stored, block-compressed on the GPU, decoded on the CPU into an uncompressed format (a device
+//   without BC) or uncompressed, and the largest formats; "guest" is the size of the same texels in the game's pool, which holds them too.
+//   image memory: the driver's memory for render targets, for textures filled from guest memory and for the rest; what the idle sweep can drop; the pools; the blocks small
+//   images share and how much of them is taken; scratch memory and descriptor pools (kept per submission slot).
+//   pools by target memory: for the pools that hold most of it, how much of the pool is the storage of images only the GPU writes. That storage is never read: the image is
+//   the driver's, and the pool's pages under it are held all the same (a zero-copy pool is one hardware buffer).
+//   GPU mappings: the process's mappings of the GPU's device and of dma-bufs by size (/proc/self/smaps, read on a thread of its own), which tells the driver's own
+//   allocations apart (a size that repeats is one kind of buffer). Called with g_img_mu held
+static void *mem_maps_thread(void *arg) {
+    (void)arg; FILE *f = fopen("/proc/self/smaps", "r"); if (!f) return NULL;
+    enum { NB = 20 }; uint64_t n[2][NB] = {{0}}, sz[2][NB] = {{0}}, rss[2][NB] = {{0}}; int k = -1, bk = 0; char ln[512];   // [0] the GPU device, [1] dma-bufs; buckets: 4 KB << b
+    while (fgets(ln, sizeof ln, f)) {
+        unsigned long long lo, hi; char perms[8];
+        if (sscanf(ln, "%llx-%llx %7s", &lo, &hi, perms) == 3 && hi > lo && (perms[0] == 'r' || perms[0] == '-') && (perms[3] == 'p' || perms[3] == 's')) {
+            k = strstr(ln, "kgsl") || strstr(ln, "mali") ? 0 : strstr(ln, "dmabuf") ? 1 : -1;
+            if (k >= 0) { uint64_t s = hi - lo; bk = 0; while (bk < NB - 1 && (4096ull << bk) < s) bk++; n[k][bk]++; sz[k][bk] += s; }
+        } else if (k >= 0 && !strncmp(ln, "Rss:", 4)) rss[k][bk] += strtoull(ln + 4, NULL, 10) << 10;
+    }
+    fclose(f);
+    for (k = 0; k < 2; k++) { char b[1200]; int o = 0; uint64_t tn = 0, ts = 0, tr = 0; b[0] = 0;
+        for (int i = 0; i < NB; i++) { if (!n[k][i]) continue; tn += n[k][i]; ts += sz[k][i]; tr += rss[k][i];
+            if (o < (int)sizeof b - 80) o += snprintf(b + o, sizeof b - (size_t)o, " up to %llu KB: %llu, %.0f MB (resident %.0f);", (unsigned long long)(4ull << i), (unsigned long long)n[k][i], sz[k][i] / 1048576.0, rss[k][i] / 1048576.0); }
+        VKLOG("GPU mappings, %s: %llu, %.0f MB (resident %.0f MB):%s", k ? "dma-bufs (pools, window images)" : "the GPU device (the driver's memory)", (unsigned long long)tn, ts / 1048576.0, tr / 1048576.0, b); }
+    return NULL;
+}
+static void mem_line(void) {
+    // [0] drawn into (render targets), [1] filled from guest memory (packaged textures), [2] the rest; [3] of them, not looked up for PKG_IDLE presents; [4] what the idle sweep can drop
+    uint64_t n[5] = {0}, vk[5] = {0}, gb[5] = {0};
+    // textures (not render targets) by how their format is stored: [0] block-compressed on the GPU, [1] decoded on the CPU into an uncompressed format, [2] uncompressed;
+    // and by NVN format, for the largest few
+    uint64_t kn[3] = {0}, kvk[3] = {0}, kgb[3] = {0}; static uint64_t fvk[0x9D], fgb[0x9D], fn_[0x9D]; memset(fvk, 0, sizeof fvk); memset(fgb, 0, sizeof fgb); memset(fn_, 0, sizeof fn_);
+    enum { NP = 48 }; struct { const pool_t *p; uint64_t rt, tex; uint32_t nrt, ntex; } pl[NP]; int npl = 0;   // per NVN pool: the storage of GPU-written images, of the others
+    for (int m = 0; m < 2; m++) { nvn_hmap *h = m ? &g_by_serial : &g_by_key;
+        for (uint32_t i = 0; i < h->cap; i++) { vkimg_t *im = h->vals[i]; if (!im) continue;
+            int c = im->rt_last ? 0 : im->packaged ? 1 : 2; uint64_t g = im->size > 0 ? (uint64_t)im->size : 0;
+            n[c]++; vk[c] += im->vk_bytes; gb[c] += g;
+            if (g_tex_frame - im->used >= PKG_IDLE) { n[3]++; vk[3] += im->vk_bytes; gb[3] += g; }
+            if (!m && idle_storage_backed(im)) { n[4]++; vk[4] += im->vk_bytes; gb[4] += g; }
+            if (c && im->nvn_format > 0 && im->nvn_format < 0x9D) { const vkfmt_t *f = vk_fmt(im->nvn_format); int k = !f ? 2 : f->dec ? 1 : f->compressed ? 0 : 2;
+                kn[k]++; kvk[k] += im->vk_bytes; kgb[k] += g; fn_[im->nvn_format]++; fvk[im->nvn_format] += im->vk_bytes; fgb[im->nvn_format] += g; }
+            if (!m && im->pool) { int q = 0; while (q < npl && pl[q].p != (const pool_t *)(uintptr_t)im->pool) q++;
+                if (q == npl && npl < NP) { memset(&pl[npl], 0, sizeof pl[npl]); pl[npl++].p = (const pool_t *)(uintptr_t)im->pool; }
+                if (q < npl) { if (im->gpu_w || im->rt_last) { pl[q].rt += g; pl[q].nrt++; } else { pl[q].tex += g; pl[q].ntex++; } } } } }
+    char top[1400]; int tl = 0; top[0] = 0;
+    for (int r = 0; r < 8; r++) { int b = 0; for (int x = 1; x < 0x9D; x++) if (fvk[x] > fvk[b]) b = x; if (!fvk[b]) break;
+        const vkfmt_t *f = vk_fmt(b); tl += snprintf(top + tl, sizeof top - (size_t)tl, "%s%#x->vk%d%s %llu, %.0f MB (guest %.0f MB)", r ? "; " : "", b, f ? (int)f->vk : -1,
+            f && f->dec ? " decoded" : f && f->compressed ? " compressed" : "", (unsigned long long)fn_[b], fvk[b] / 1048576.0, fgb[b] / 1048576.0); fvk[b] = 0;
+        if (tl >= (int)sizeof top - 160) break; }
+    const double M = 1048576.0;
+    VKLOG("texture formats: compressed on the GPU %llu, %.0f MB (guest %.0f MB); decoded on the CPU %llu, %.0f MB (guest %.0f MB); uncompressed %llu, %.0f MB (guest %.0f MB); largest: %s",
+          (unsigned long long)kn[0], kvk[0] / M, kgb[0] / M, (unsigned long long)kn[1], kvk[1] / M, kgb[1] / M, (unsigned long long)kn[2], kvk[2] / M, kgb[2] / M, top);
+    void vk_pool_mem(uint64_t *zc, uint64_t *cp, uint64_t *slab, uint64_t *kept); uint64_t zc, cp, sl, kp; vk_pool_mem(&zc, &cp, &sl, &kp);
+    void vk_mem_stats(uint64_t o[8]); uint64_t ms[8]; vk_mem_stats(ms); uint64_t vk_pool_lazy_bytes(void);
+    VKLOG("image memory: render targets %llu, %.0f MB (guest %.0f MB); textures from guest memory %llu, %.0f MB (guest %.0f MB); other %llu, %.0f MB (guest %.0f MB); "
+          "idle %d presents %llu, %.0f MB; the idle sweep's %llu, %.0f MB (%llu dropped so far, %.0f MB; %llu made again); pools zero-copy %.0f MB, copied %.0f MB, no buffer yet %.0f MB, slabs %.0f MB, kept buffers %.0f MB; "
+          "image blocks %llu, %.0f MB (%.0f MB taken; %llu given back); scratch %llu blocks, %.0f MB (%llu given back); descriptor pools %llu",
+          (unsigned long long)n[0], vk[0] / M, gb[0] / M, (unsigned long long)n[1], vk[1] / M, gb[1] / M, (unsigned long long)n[2], vk[2] / M, gb[2] / M,
+          (int)PKG_IDLE, (unsigned long long)n[3], vk[3] / M, (unsigned long long)n[4], vk[4] / M, (unsigned long long)g_idle_n, g_idle_bytes / M, (unsigned long long)g_idle_back,
+          zc / M, cp / M, vk_pool_lazy_bytes() / M, sl / M, kp / M, (unsigned long long)ms[6], ms[4] / M, ms[5] / M, (unsigned long long)ms[7], (unsigned long long)ms[1], ms[0] / M, (unsigned long long)ms[2], (unsigned long long)ms[3]);
+    tl = 0; top[0] = 0;
+    for (int r = 0; r < 12; r++) { int b = -1; for (int q = 0; q < npl; q++) if (pl[q].rt && (b < 0 || pl[q].rt > pl[b].rt)) b = q; if (b < 0) break;
+        tl += snprintf(top + tl, sizeof top - (size_t)tl, "%s%p +%.1f MB flags %#x: %u targets %.1f MB, %u textures %.1f MB", r ? "; " : "", (const void *)pl[b].p->mem, pl[b].p->size / M, pl[b].p->flags,
+                       pl[b].nrt, pl[b].rt / M, pl[b].ntex, pl[b].tex / M); pl[b].rt = 0;
+        if (tl >= (int)sizeof top - 110) break; }
+    if (tl) VKLOG("pools by target memory (storage of images only the GPU writes; sizes as laid out in the pool): %s", top);
+    pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED); pthread_create(&th, &at, mem_maps_thread, NULL); pthread_attr_destroy(&at);
+}
 void vk_tex_sweep(void) {
     if (++g_tex_frame % 300) return;
     uint64_t idle = 0, lru = 0, before = nvn_dirty_released();
     pthread_mutex_lock(&g_img_mu);
     pkg_age *v = NULL; size_t nv = 0, cap = 0;
+    if (g_tex_frame % 900 == 0 && env_i64("DM_VK_MEM_LOG", 0)) mem_line();
     for (int m = 0; m < 2; m++) {
         nvn_hmap *h = m ? &g_by_serial : &g_by_key;
         for (uint32_t i = 0; i < h->cap; i++) {
@@ -444,10 +613,14 @@ void vk_tex_sweep(void) {
             runs = nvn_dirty_runs();
         }
     }
+    uint64_t dn = g_idle_n, db = g_idle_bytes, dk = g_idle_back;
     pthread_mutex_unlock(&g_img_mu);
     free(v);
+    atomic_store(&g_idle_due, 1);   // the idle textures' images go at the next submission (vk_tex_evict_idle)
+    { void vk_image_blocks_trim(void); vk_image_blocks_trim(); }
     static uint64_t total; total += idle + lru;
-    if (g_tex_frame % 3000 == 0) VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory)", (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted);
+    if (g_tex_frame % 3000 == 0) VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory), %llu dropped idle (%.0f MB of image memory; %llu made again)",
+                                       (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted, (unsigned long long)dn, db / 1048576.0, (unsigned long long)dk);
     if ((idle || lru) && (g_tex_frame % 3000 == 0 || lru)) VKLOG("packaged textures: %llu not drawn for %d presents and %llu least recently drawn released their write protection (%llu pages; %llu so far); %d protected runs",
                     (unsigned long long)idle, PKG_IDLE, (unsigned long long)lru, (unsigned long long)(nvn_dirty_released() - before), (unsigned long long)total, runs);
 }
@@ -463,6 +636,15 @@ void vk_tex_drop_pool(const void *pool) {   // the pool is finalized: its textur
             if (ks[n].pool == (uint64_t)(uintptr_t)pool) n++;
         }
         for (int j = 0; j < n; j++) { vkimg_t *im = nvn_hm_get(&g_by_key, &ks[j]); if (!im) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(im); }
+    }
+    for (int n = 64; n == 64 && g_refill.n;) {   // and the keys of its images the idle sweep dropped
+        akey ks[64]; n = 0;
+        for (uint32_t i = 0; i < g_refill.cap && n < 64; i++) {
+            if (!g_refill.vals[i]) continue;
+            memcpy(&ks[n], g_refill.keys + (size_t)i * g_refill.klen, sizeof ks[n]);
+            if (ks[n].pool == (uint64_t)(uintptr_t)pool) n++;
+        }
+        for (int j = 0; j < n; j++) nvn_hm_del(&g_refill, &ks[j]);
     }
     pthread_mutex_unlock(&g_img_mu);
 }

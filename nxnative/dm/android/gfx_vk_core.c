@@ -562,7 +562,7 @@ int vk_pool_remap_ro(void *mem, size_t len) {
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool && !rc; i++) {
         vkpool_t *p = &g_pool[i]; if (p->base != (uint64_t)(uintptr_t)mem || p->end - p->base != len) continue;
-        if (!p->zero_copy) { if (!p->shadow) { rc = -1; break; } done += p->hi - p->lo; continue; }   // a copied pool: nothing to map again (its protection stays as it is), and done, so defrag stops taking its pages busy
+        if (!p->zero_copy) { if (!p->shadow && !p->lazy) { rc = -1; break; } done += p->hi - p->lo; continue; }   // a copied pool: nothing to map again (its protection stays as it is), and done, so defrag stops taking its pages busy
         if (p->slab) { void *at = (void *)(uintptr_t)p->lo; rc = mmap(at, p->hi - p->lo, PROT_READ, MAP_SHARED | MAP_FIXED, ((slab_t *)p->slab)->fd, (off_t)p->boff) == at ? 0 : -1; if (!rc) done += p->hi - p->lo; continue; }   // a slab's slot
         int sv[2], fds[16], nfd = -1; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { rc = -1; break; }
         if (!AHardwareBuffer_sendHandleToUnixSocket(p->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
@@ -584,15 +584,33 @@ static void pool_copy_back(vkpool_t *p) {   // the pages go back to anonymous me
 // (vendor.qti.hardware.display.allocator-service, snapalloc) aborts on a BLOB of 812 MB ("ubsan: mul-overflow" in SnapConstraintManager::AlignmentToAlignedConstraints),
 // and the whole Android UI restarts with it; 400 MB ones work (13 Sentinels: Aegis Rim's 0x32c00000-byte pool). A range across two chunks has no buffer (vk_pool_of)
 #define ZC_CHUNK 0x10000000ull
-static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end);
+static uint64_t g_pool_zc_live, g_pool_cp_live, g_pool_lazy_live;   // live pool bytes: zero-copy, copied, and without a buffer yet (the memory line, gfx_vk_tex.c mem_line)
+uint64_t vk_pool_lazy_bytes(void) { return __atomic_load_n(&g_pool_lazy_live, __ATOMIC_RELAXED); }
+void vk_pool_mem(uint64_t *zc, uint64_t *cp, uint64_t *slab, uint64_t *kept) {
+    *zc = __atomic_load_n(&g_pool_zc_live, __ATOMIC_RELAXED); *cp = __atomic_load_n(&g_pool_cp_live, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_slab_mu); *slab = g_slab_bytes; pthread_mutex_unlock(&g_slab_mu);
+    pthread_mutex_lock(&g_zcf_mu); *kept = g_zcf_bytes; pthread_mutex_unlock(&g_zcf_mu);
+}
+static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end, int lazy);
+// A pool the game made CPU_NO_ACCESS takes no buffer when it is made, only when something first needs the buffer over its memory (vk_pool_of: a buffer binding, a copy,
+// a linear texture's storage). The game cannot read or write such a pool, so nothing of it has to be shared with the CPU, and what games keep there is render targets:
+// their images are the driver's own, and the pool's memory under them is never read. NieR:Automata has six of them (0xa1: CPU_NO_ACCESS | GPU_CACHED | COMPRESSIBLE; 250,
+// 32, 32, 16, 16 and 16 MB) holding 175 MB of targets; as zero-copy pools their 362 MB were hardware buffers, which the kernel can neither swap nor drop, on a tablet
+// that swapped for want of that much. Left alone, the range stays the game's own pages (never touched: no memory at all). Because the CPU does not access it, giving it
+// its hardware buffer later (the pages are copied, then mapped over) races with no write of the game's. DM_VK_POOL_LAZY=0 (start-up): every pool takes its buffer when made
+static __thread int g_next_flags = -1;   // vk_pool_next_flags: the NVN flags of the pool this thread adds next (hle_nvn.c nvnMemoryPoolInitialize), -1 not said
+void vk_pool_next_flags(int flags) { g_next_flags = flags; }
+static int pool_lazy_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_POOL_LAZY"); v = !(e && !atoi(e)); } return v; }
 // DM_VK_ZEROCOPY_MAX_MB=<n>: pools bigger than n MB are copied, not zero-copy, and kept whole (a copied pool takes no hardware buffer, so no chunks). The Legion Y700
 // 2023's gralloc aborts the process (no error returned) allocating a hardware buffer for Unicorn Overlord's 860 MB pool, while its pools up to 250 MB are fine
 static int zc_over(uint64_t size) { static uint64_t m = 1; if (m == 1) { const char *e = getenv("DM_VK_ZEROCOPY_MAX_MB"); m = e && atoi(e) > 0 ? (uint64_t)atoi(e) << 20 : 0; } return m && size > m; }
 void mtl_pool_add(const void *mem, uint64_t size) {
     vk_init();
     if (!size) return;
+    int flags = g_next_flags; g_next_flags = -1;
+    int lazy = flags >= 0 && (flags & 0x1) && !(flags & 0x300) && pool_lazy_on();   // CPU_NO_ACCESS, and not a physical or virtual pool (sparse textures' pages are mapped between them)
     uint64_t a = (uint64_t)(uintptr_t)mem, c = ((a | size) & 0xfff) || zc_over(size) ? size : ZC_CHUNK;
-    for (uint64_t o = 0; o < size; o += c) pool_add_one((const uint8_t *)mem + o, size - o < c ? size - o : c, a, a + size);
+    for (uint64_t o = 0; o < size; o += c) pool_add_one((const uint8_t *)mem + o, size - o < c ? size - o : c, a, a + size, lazy);
     if (size > c) VKLOG("memory pool %p +%#llx: %llu chunks of at most %#llx", mem, (unsigned long long)size, (unsigned long long)((size + c - 1) / c), c);
 }
 // The pool line: pools made and dropped with their time on the calling threads and the reuse counts, at most once a second and only for a second in which
@@ -620,12 +638,13 @@ static void pool_note(int kind, uint64_t bytes, uint64_t ns) {   // kind 0: made
 // into it and the driver's import take milliseconds each, and every lookup waits on the lock (vk_pool_of: each buffer binding of each draw on the replay thread, and the
 // game threads' mtl_addr, once a pool was added or removed). Pokémon Scarlet makes and drops pools on three threads at once while a thrown ball flies (its capture assets,
 // ~180 MB read in 1.5 s): the replay thread stood almost still for a second with the GPU idle (simpleperf), in frames of 100-580 ms
-static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end) {
+static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end, int lazy) {
     uint64_t t0 = pool_ns();
     vkpool_t q, *p = &q; memset(p, 0, sizeof *p);
     p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end;
-    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(end - base) ? -5 : pool_zero_copy(p, (uint8_t *)mem, size);
-    if (zc) {
+    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(end - base) ? -5 : lazy ? 1 : pool_zero_copy(p, (uint8_t *)mem, size);
+    if (zc == 1) p->lazy = 1;   // (a pool that would have been zero-copy: no buffer yet)
+    else if (zc) {
         static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx could not be zero-copy (%d): a GPU copy is refreshed before each submission (slow)", mem, (unsigned long long)size, zc);
         const char *e = getenv("DM_VK_POOL_CACHED"); int cached = e && atoi(e);
         VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
@@ -643,8 +662,10 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
     int np = g_npool;
     pthread_rwlock_unlock(&g_pool_mu);
     if (np >= 1024 && !(np & (np - 1))) VKLOG("%d memory pools live", np);
-    static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
-    static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s (zero-copy %.1f MB, copied %.1f MB)", mem, (unsigned long long)size, zc ? "copied" : "zero-copy", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
+    static uint64_t zc_bytes, cp_bytes, lz_bytes; if (zc == 1) lz_bytes += size; else if (zc) cp_bytes += size; else zc_bytes += size;
+    __atomic_fetch_add(zc == 1 ? &g_pool_lazy_live : zc ? &g_pool_cp_live : &g_pool_zc_live, size, __ATOMIC_RELAXED);
+    static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s (zero-copy %.1f MB, copied %.1f MB, no buffer yet %.1f MB)", mem, (unsigned long long)size, zc == 1 ? "no buffer yet (the game cannot access it from the CPU)" : zc ? "copied" : "zero-copy",
+                                            zc_bytes / 1048576.0, cp_bytes / 1048576.0, lz_bytes / 1048576.0);
     pool_note(0, size, pool_ns() - t0);
 }
 void mtl_pool_del(const void *mem) {
@@ -656,9 +677,11 @@ void mtl_pool_del(const void *mem) {
         pthread_rwlock_unlock(&g_pool_mu);
         uint64_t t0 = pool_ns();
         if (p.zero_copy) pool_copy_back(&p);
+        __atomic_fetch_sub(p.lazy ? &g_pool_lazy_live : p.zero_copy ? &g_pool_zc_live : &g_pool_cp_live, p.hi - p.lo, __ATOMIC_RELAXED);
         free(p.baseline);
         { void vk_tbuf_drop_pool(uint64_t); vk_tbuf_drop_pool(p.serial); }   // the texel buffer views over its buffer (gfx_vk_tex.c), before the buffer itself goes or is kept
-        if (p.slab) slab_give(p.slab, p.slot, mtl_last_fence() + 1);   // the slot goes back to its slab (the GPU may still read it until that submission is done)
+        if (p.lazy) {}   // (it never took a buffer)
+        else if (p.slab) slab_give(p.slab, p.slot, mtl_last_fence() + 1);   // the slot goes back to its slab (the GPU may still read it until that submission is done)
         else if (!(p.zero_copy && p.ahb && zcf_put(p.ahb, p.buf, p.mem, p.hi - p.lo))) {   // (kept for the next pool of its size)
             vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference
             if (p.ahb) AHardwareBuffer_release(p.ahb);
@@ -666,7 +689,31 @@ void mtl_pool_del(const void *mem) {
         pool_note(1, p.hi - p.lo, pool_ns() - t0);
     }
 }
+// A lazy pool takes its buffer (mtl_pool_add says why it had none). Under g_lazy_mu and the pools' read lock: the entry is found again by its start (a pool removed
+// meanwhile is not touched), and its buffer is in place before lazy is cleared, which is what every user of the buffer waits for (vk_pool_of)
+static pthread_mutex_t g_lazy_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pool_take_buffer(uint64_t lo) {
+    pthread_mutex_lock(&g_lazy_mu); pthread_rwlock_rdlock(&g_pool_mu);
+    vkpool_t *p = NULL; for (int i = 0; i < g_npool; i++) if (g_pool[i].lo == lo) { p = &g_pool[i]; break; }
+    if (p && __atomic_load_n(&p->lazy, __ATOMIC_ACQUIRE)) {
+        uint64_t size = p->hi - p->lo, t0 = pool_ns();
+        int zc = pool_zero_copy(p, (uint8_t *)(uintptr_t)p->lo, size);
+        if (zc) { VKLOG("[RED] memory pool %p +%#llx could not be zero-copy when its buffer was first needed (%d): a GPU copy, synchronized from the next submission on", (void *)(uintptr_t)p->lo, (unsigned long long)size, zc);
+                  VKCHK(pool_copied_alloc(p, size, 0)); }
+        __atomic_fetch_sub(&g_pool_lazy_live, size, __ATOMIC_RELAXED); __atomic_fetch_add(zc ? &g_pool_cp_live : &g_pool_zc_live, size, __ATOMIC_RELAXED);
+        __atomic_store_n(&p->lazy, 0, __ATOMIC_RELEASE);
+        VKLOG("memory pool %p +%#llx (NVN flags %#x, no CPU access): its buffer is needed now, made in %.1f ms; %.1f MB of pools still have none", (void *)(uintptr_t)p->lo, (unsigned long long)size, p->flags,
+              (pool_ns() - t0) / 1e6, __atomic_load_n(&g_pool_lazy_live, __ATOMIC_RELAXED) / 1048576.0);
+    }
+    pthread_rwlock_unlock(&g_pool_mu); pthread_mutex_unlock(&g_lazy_mu);
+}
+static vkpool_t *pool_find(uint64_t addr, uint64_t len);
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
+    vkpool_t *p = pool_find(addr, len);
+    if (p && __atomic_load_n(&p->lazy, __ATOMIC_ACQUIRE)) pool_take_buffer(p->lo);
+    return p;
+}
+static vkpool_t *pool_find(uint64_t addr, uint64_t len) {
     // the last pools this thread found, while none was added or removed: the replay looks up every buffer binding of every draw, and the read lock alone was ~6% of it
     static __thread struct { uint32_t gen; vkpool_t *p[4]; } c;   // gen: g_pool_gen + 1 (0: empty)
     uint32_t g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1;
@@ -700,8 +747,11 @@ void mtl_alias_drop_pool(const void *pool) { void vk_tex_drop_pool(const void *)
 // the game reads GPU results from cached memory, so such a pool is not copied back after each submission
 void vk_pool_set_flags(const void *mem, int flags) {
     pthread_rwlock_rdlock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) g_pool[i].flags = flags;   // (every chunk of it)
+    uint64_t size = 0;
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) { g_pool[i].flags = flags; size = g_pool[i].end - g_pool[i].base; }   // (every chunk of it)
     pthread_rwlock_unlock(&g_pool_mu);
+    // DM_VK_MEM_LOG: what the game says of each pool of 1 MB or more (1 CPU_NO_ACCESS, 2 CPU_UNCACHED, 4 CPU_CACHED, 8 GPU_NO_ACCESS, 0x10 GPU_UNCACHED, 0x20 GPU_CACHED)
+    { static int n; const char *e = getenv("DM_VK_MEM_LOG"); if (e && atoi(e) && size >= (1u << 20) && n < 96) { n++; VKLOG("memory pool %p +%#llx: NVN flags %#x", mem, (unsigned long long)size, flags); } }
 }
 static uint64_t g_sync_bytes, g_sync_full;   // copied pools: bytes copied by the incremental sync, full copies
 // Copied pools: the guest's bytes into the GPU copy. The first sync copies the whole pool; later ones copy only the 64 KB blocks with pages the CPU wrote since the last
@@ -775,7 +825,12 @@ static VkQueryPool g_tsq; uint64_t g_gpu_ns;
 enum { CQ = 64 };
 static VkQueryPool g_cq;
 #define SCRATCH_BLOCK (8u << 20)
-typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; } scratch_blk;
+// A slot's scratch blocks beyond its first go back to the driver when SCRATCH_IDLE submissions of the slot in a row left them unused (slot_recycle). They were kept for
+// good, so each of the NSLOT slots held the scratch memory of the largest submission it ever recorded: a load's texture uploads (tens of MB in one submission) stayed
+// allocated, host-visible and mapped, for the rest of the session
+enum { SCRATCH_IDLE = 64 };
+typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; int idle; } scratch_blk;
+static uint64_t g_scratch_bytes, g_scratch_n, g_scratch_freed, g_dp_n;   // live scratch memory and blocks, blocks given back so far, descriptor pools (atomic: the memory line)
 typedef struct { int kind; void *a; void *b; } dfree_t;   // 0 buffer+memory, 1 image+memory, 2 view
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; int q; } post_op;   // q: a timestamp counter's query in g_cq, or -1
 struct vksub {
@@ -935,7 +990,14 @@ static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last 
         else if (d->kind == 3) vkDestroyBufferView(V.dev, (VkBufferView)d->a, NULL);
     }
     free(df);
-    for (int i = 0; i < s->nblk; i++) s->blk[i].used = 0;
+    int nb = 0;
+    for (int i = 0; i < s->nblk; i++) {   // (the GPU has passed the slot's submission, and a block it left unused was not in it)
+        scratch_blk *b = &s->blk[i]; b->idle = b->used ? 0 : b->idle + 1; b->used = 0;
+        if (i && b->idle >= SCRATCH_IDLE) { vkDestroyBuffer(V.dev, b->b, NULL); vkFreeMemory(V.dev, b->m, NULL);   // (freeing the memory unmaps it)
+            __atomic_fetch_sub(&g_scratch_bytes, b->size, __ATOMIC_RELAXED); __atomic_fetch_sub(&g_scratch_n, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_scratch_freed, 1, __ATOMIC_RELAXED); continue; }
+        s->blk[nb++] = *b;
+    }
+    s->nblk = nb;
     for (int i = 0; i < s->ndp; i++) vkResetDescriptorPool(V.dev, s->dp[i], 0);
     s->dp_cur = 0; s->dp_counted = -1;
     // The pool is not reset: each command buffer is reset as it is begun again (the pool allows it). A reset of the transient pool made Adreno's driver free the
@@ -1003,6 +1065,7 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
     VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
     void *m; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &m)); b->p = m;
+    __atomic_fetch_add(&g_scratch_bytes, b->size, __ATOMIC_RELAXED); __atomic_fetch_add(&g_scratch_n, 1, __ATOMIC_RELAXED);
     b->used = n; *buf = b->b; *off = 0; return b->p;
 }
 // The deferred frees have a lock of their own: the replay thread adds to its slot's list while it records (holding g_sub_lock for the whole submission), and a game
@@ -1029,12 +1092,29 @@ static void df_add(int kind, void *a, void *b) {
 // ran towards the kernel's per-process mapping limit (Xenoblade Chronicles 3: about 9,400 driver mappings in its first area, 2,216 of them 172 KB). Images up to
 // IMG_SLOT_MAX take a slot of a block (64 slots, 2 MB to IMG_BLOCK bytes), in size classes 2^(k/2) x 4 KB apart (a slot is at most 41% larger than the image); larger ones, or
 // ones that need more than 4 KB alignment, get memory of their own
-enum { IMG_CLASSES = 18, IMG_BLOCK = 32 << 20 };
+// A block whose slots are all free goes back to the driver once it has stayed so from one trim to the next (vk_image_blocks_trim, every 300 presents), and a new image
+// takes a slot of the fullest block of its class, so the blocks that images leave empty out. Blocks used to be kept for good: with images dropped only when their pool went
+// that cost nothing, but the textures the idle sweep now drops (gfx_vk_tex.c vk_tex_evict_idle) would have left their memory with the driver.
+// A block is at most IMG_BLOCK bytes, 8 MB: at 32 MB, the classes of large slots made a whole block for a few images each (NieR:Automata's desert on a Xiaomi Pad 7:
+// 21 blocks of 270 MB in all with 106 MB of their slots taken). A 2 MB class now has 4 slots a block, a 128 KB one 64 as before
+enum { IMG_CLASSES = 18, IMG_BLOCK = 8 << 20 };
 #define IMG_SLOT_MAX ((VkDeviceSize)2 << 20)
-typedef struct imgblk { VkDeviceMemory m; uint32_t type, cls, nslot, nfree; uint64_t bits[128]; struct imgblk *next; } imgblk;   // bits: 1 = slot free
+typedef struct imgblk { VkDeviceMemory m; uint32_t type, cls, nslot, nfree; int idle; uint64_t bits[128]; struct imgblk *next; } imgblk;   // bits: 1 = slot free; idle: all free at the last trim
 typedef struct { imgblk *b; uint32_t slot; } imgsub;
 static imgblk *g_imgblk[IMG_CLASSES]; static pthread_mutex_t g_imgblk_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_imgblk_n, g_imgblk_bytes, g_imgblk_used, g_imgblk_freed;   // blocks, their memory, the slots taken of it, blocks given back so far (under g_imgblk_mu: the memory line)
 static VkDeviceSize img_class_size(int c) { return (c & 1 ? 6144ull : 4096ull) << (c >> 1); }   // 4K, 6K, 8K, 12K, 16K, 24K, ... 2M
+void vk_image_blocks_trim(void) {
+    imgblk *dead = NULL;
+    pthread_mutex_lock(&g_imgblk_mu);
+    for (int c = 0; c < IMG_CLASSES; c++) for (imgblk **pb = &g_imgblk[c], *b; (b = *pb); ) {
+        if (b->nfree != b->nslot) { b->idle = 0; pb = &b->next; continue; }
+        if (!b->idle) { b->idle = 1; pb = &b->next; continue; }
+        *pb = b->next; b->next = dead; dead = b; g_imgblk_n--; g_imgblk_bytes -= (uint64_t)b->nslot * img_class_size(c); g_imgblk_freed++;
+    }
+    pthread_mutex_unlock(&g_imgblk_mu);
+    while (dead) { imgblk *b = dead; dead = b->next; vkFreeMemory(V.dev, b->m, NULL); free(b); }   // (its images were destroyed before their slots came back: img_sub_free)
+}
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub) {
     *off = 0; *sub = NULL;
     int c = 0; while (c < IMG_CLASSES && img_class_size(c) < req->size) c++;
@@ -1043,22 +1123,29 @@ VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, V
         return vkAllocateMemory(V.dev, &ai, NULL, &m) ? VK_NULL_HANDLE : m;
     }
     pthread_mutex_lock(&g_imgblk_mu);
-    imgblk *b = g_imgblk[c]; while (b && (b->type != type || !b->nfree)) b = b->next;
+    imgblk *b = NULL; for (imgblk *x = g_imgblk[c]; x; x = x->next) if (x->type == type && x->nfree && (!b || x->nfree < b->nfree)) b = x;   // the fullest one
     if (!b) {
-        b = calloc(1, sizeof *b); b->type = type; b->cls = (uint32_t)c; VkDeviceSize bs = img_class_size(c) * 64; if (bs < (2 << 20)) bs = 2 << 20; if (bs > IMG_BLOCK) bs = IMG_BLOCK; b->nslot = (uint32_t)(bs / img_class_size(c));   // 64 slots, 2 MB to 32 MB
+        b = calloc(1, sizeof *b); b->type = type; b->cls = (uint32_t)c; VkDeviceSize bs = img_class_size(c) * 64; if (bs < (2 << 20)) bs = 2 << 20; if (bs > IMG_BLOCK) bs = IMG_BLOCK; b->nslot = (uint32_t)(bs / img_class_size(c));   // 64 slots, 2 MB to IMG_BLOCK
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)b->nslot * img_class_size(c), type};
         if (vkAllocateMemory(V.dev, &ai, NULL, &b->m)) { pthread_mutex_unlock(&g_imgblk_mu); free(b); return VK_NULL_HANDLE; }
         for (uint32_t i = 0; i < b->nslot; i++) b->bits[i >> 6] |= 1ull << (i & 63);
-        b->nfree = b->nslot; b->next = g_imgblk[c]; g_imgblk[c] = b;
+        b->nfree = b->nslot; b->next = g_imgblk[c]; g_imgblk[c] = b; g_imgblk_n++; g_imgblk_bytes += ai.allocationSize;
     }
     uint32_t i = 0; while (!b->bits[i >> 6]) i += 64; i += (uint32_t)__builtin_ctzll(b->bits[i >> 6]);
-    b->bits[i >> 6] &= ~(1ull << (i & 63)); b->nfree--;
+    b->bits[i >> 6] &= ~(1ull << (i & 63)); b->nfree--; b->idle = 0; g_imgblk_used += img_class_size(c);
     pthread_mutex_unlock(&g_imgblk_mu);
     imgsub *s = malloc(sizeof *s); s->b = b; s->slot = i; *sub = s; *off = (VkDeviceSize)i * img_class_size(c);
     return b->m;
 }
-static void img_sub_free(imgsub *s) {   // the slot is free again; blocks are kept (the next images of the class take them)
-    pthread_mutex_lock(&g_imgblk_mu); s->b->bits[s->slot >> 6] |= 1ull << (s->slot & 63); s->b->nfree++; pthread_mutex_unlock(&g_imgblk_mu); free(s);
+static void img_sub_free(imgsub *s) {   // the slot is free again; its block goes once all of them have been for a while (vk_image_blocks_trim)
+    pthread_mutex_lock(&g_imgblk_mu); s->b->bits[s->slot >> 6] |= 1ull << (s->slot & 63); s->b->nfree++; g_imgblk_used -= img_class_size((int)s->b->cls); pthread_mutex_unlock(&g_imgblk_mu); free(s);
+}
+// The backend's own memory, for the memory line (gfx_vk_tex.c mem_line): [0] scratch bytes, [1] scratch blocks, [2] scratch blocks given back so far, [3] descriptor pools
+// (kept per slot, each sized by DP_CAP), [4] image block bytes, [5] the bytes of their slots that are taken, [6] image blocks, [7] image blocks given back so far
+void vk_mem_stats(uint64_t o[8]) {
+    o[0] = __atomic_load_n(&g_scratch_bytes, __ATOMIC_RELAXED); o[1] = __atomic_load_n(&g_scratch_n, __ATOMIC_RELAXED); o[2] = __atomic_load_n(&g_scratch_freed, __ATOMIC_RELAXED);
+    o[3] = __atomic_load_n(&g_dp_n, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_imgblk_mu); o[4] = g_imgblk_bytes; o[5] = g_imgblk_used; o[6] = g_imgblk_n; o[7] = g_imgblk_freed; pthread_mutex_unlock(&g_imgblk_mu);
 }
 void vk_defer_free_buffer(VkBuffer b, VkDeviceMemory m) { df_add(0, (void *)b, (void *)m); }
 void vk_defer_free_image_sub(VkImage i, void *sub) { df_add(4, (void *)i, sub); }
@@ -1089,7 +1176,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
             for (int t = 0; t < 9; t++) if (DP_CAP[t]) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, DP_CAP[t]};
             VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, DP_SETS, nz, sz};
             if (s->ndp == s->capdp) { s->capdp = s->capdp ? 2 * s->capdp : 4; s->dp = realloc(s->dp, s->capdp * sizeof *s->dp); }
-            VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &s->dp[s->ndp++]));
+            VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &s->dp[s->ndp++])); __atomic_fetch_add(&g_dp_n, 1, __ATOMIC_RELAXED);
         }
         if (s->dp_cur != s->dp_counted) { memset(s->dp_used, 0, sizeof s->dp_used); s->dp_sets = 0; s->dp_counted = s->dp_cur; }
         int fits = s->dp_sets < DP_SETS;

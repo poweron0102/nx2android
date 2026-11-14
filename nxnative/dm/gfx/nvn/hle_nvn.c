@@ -208,12 +208,13 @@ static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o); 
 static void replay_lock(void); static void replay_unlock(void);   // the replay's state, from a game thread (see "Asynchronous replay")
 static void nvn_drain(void);
 __attribute__((weak)) void vk_pool_set_flags(const void *mem, int flags) { (void)mem; (void)flags; }
+__attribute__((weak)) void vk_pool_next_flags(int flags) { (void)flags; }   // Android's Vulkan host: the flags of the pool this thread's next mtl_pool_add is for (a CPU_NO_ACCESS pool takes no buffer yet)
 __attribute__((weak)) void dm_perf_replay_thread(void) {}   // Android (perf_android.c): the replay thread's CPU placement   // Android's Vulkan host (gfx_vk_core.c): copied pools by their flags
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
-    else if (o->mem) { replay_lock(); mtl_pool_add(o->mem, o->size); vk_pool_set_flags(o->mem, o->flags); replay_unlock(); nvn_dirty_add_range(o->mem, o->size); }
+    else if (o->mem) { replay_lock(); vk_pool_next_flags(o->flags); mtl_pool_add(o->mem, o->size); vk_pool_set_flags(o->mem, o->flags); replay_unlock(); nvn_dirty_add_range(o->mem, o->size); }
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     if (getenv("DM_NVN_VLOG")) { LOG("[nvn] MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags); void dm_backtrace(uint64_t fp); dm_backtrace((uint64_t)__builtin_frame_address(0)); }
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
@@ -2610,7 +2611,17 @@ static int write_region_bl(const tex_t *t, unsigned level, unsigned layer, const
     uint32_t x0 = (uint32_t)(r->xoffset / bw) * (uint32_t)bpb, y0 = (uint32_t)(r->yoffset / bh);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * (size_t)bpb, hb = (size_t)((r->height + bh - 1) / bh);
     if (x0 + wb > row_bytes || y0 + hb > rows) return -1;
+    if (!wb || !hb) return 0;
     uint32_t lb = nvn_tex_level_gobs(&t->d, level) * 64; if (lb < row_bytes) lb = row_bytes;   // the row as laid out (padded in a sparse texture's tiled levels)
+    // Only the blocks the region covers are made writable (dm_guest_write_prepare stamps their pages as written), one run per block row. The whole texture was, so the
+    // replay found every page written and uploaded it all again: NieR:Automata writes regions such as 36x20 into two 512x512x16 2D arrays (32 MB RGBA16F, 16 MB RGBA8)
+    // several times a frame, and 8-23 MB went up again every frame (6-15 ms of the replay's CPU on a Xiaomi Pad 7)
+    uint64_t blk = 512ull << (th + td); uint32_t bh8 = 8u << th, xb0 = x0 & ~63u, xb1 = (x0 + (uint32_t)wb - 1) & ~63u;
+    for (uint32_t br = y0 / bh8; br <= (y0 + (uint32_t)hb - 1) / bh8; br++) {
+        uint64_t lo = base + nvn_bl_offset(xb0, br * bh8, 0, lb, rows, th, td), hi = base + nvn_bl_offset(xb1, br * bh8, 0, lb, rows, th, td) + blk;
+        if (hi > t->L.size) hi = t->L.size;
+        if (lo < hi) dm_guest_write_prepare(t->mem + lo, hi - lo);
+    }
     for (size_t y = 0; y < hb; y++)
         for (size_t x = 0; x < wb;) {   // 16-byte runs are contiguous within a GOB
             uint32_t bx = x0 + (uint32_t)x; size_t n = 16 - bx % 16; if (n > wb - x) n = wb - x;
@@ -2624,10 +2635,12 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
     if (!bpb) { ONCE_LOG("[RED] WriteTexels: unknown format %#x", t->d.format); return; }
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth ? r->depth : 1;
+    { static int n; const char *e = getenv("DM_NVN_LOG_WRITETEXELS"); if (e && atoi(e) && n < 60) { n++;   // which textures the game writes, and how much of them (the whole texture is uploaded again)
+        LOG("[nvn] WriteTexels: texture %ux%ux%u format %#x target %d levels %u flags %#x size %llu at %p: level %u layer %u, region %d,%d,%d %dx%dx%d", t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target,
+            t->d.levels, t->d.flags, (unsigned long long)t->L.size, (const void *)t->mem, level, layer0, r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth); } }
     if (!is3d) {
         size_t wb0 = (size_t)((r->width + bw - 1) / bw) * bpb, row0 = row ? row : wb0, img0 = img ? img : row0 * (size_t)((r->height + bh - 1) / bh);
-        dm_guest_write_prepare(t->mem, t->L.size);
-        int ok = 1;
+        int ok = 1;   // (each layer's region made writable in write_region_bl)
         for (int z = 0; z < nz && ok; z++) ok = !write_region_bl(t, level, layer0 + (unsigned)(r->zoffset + z), r, src + (size_t)z * img0, row0, bw, bh, bpb);
         if (ok) { mtl_tex_cpu_written(t); return; }
     }

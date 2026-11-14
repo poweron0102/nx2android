@@ -159,12 +159,28 @@ static int rot_setup(void) {
     vkUpdateDescriptorSets(V.dev, 1, &wr, 0, NULL);
     return 1;
 }
+// DM_VK_SWAP_FIT=1 (read whenever the swapchain is checked: live): the swapchain is no larger than the game's picture needs. Its images are the window's shape at the
+// size where the blit copies the picture one texel to one pixel, and Android's compositor enlarges them to the window; without it they are the window's size and the blit
+// enlarges the picture. A window larger than the picture only cost memory and fill: a 1920x1080 game in a Xiaomi Pad 7's 3200x2136 window had four 27 MB window images
+// (109 MB of hardware buffers) where 1920x1282 ones take 39 MB. Never smaller than the picture, so nothing of it is lost; the overlay is drawn at the swapchain's size and
+// is enlarged with it. The largest picture shown in this window decides (a game that changes its picture's size does not get a new swapchain each time it shrinks).
+// Off by default: whether the compositor scales a layer in the display's hardware or on the GPU is the device's (the Retroid Pocket 5's rotation above)
+static VkExtent2D g_wext; static uint32_t g_fit_w, g_fit_h;   // the window the swapchain was made for; the largest picture shown in it
+static VkExtent2D swap_extent(uint32_t ww, uint32_t wh) {
+    VkExtent2D e = {ww, wh}; const char *v = getenv("DM_VK_SWAP_FIT");
+    if (!v || !atoi(v) || !g_fit_w || !g_fit_h || !ww || !wh) return e;
+    double k = fmin((double)ww / g_fit_w, (double)wh / g_fit_h);   // how much the blit would enlarge the picture
+    if (k <= 1.0) return e;
+    e.width = (uint32_t)lround(ww / k); e.height = (uint32_t)lround(wh / k);
+    if (e.width < g_fit_w) e.width = g_fit_w; if (e.height < g_fit_h) e.height = g_fit_h;   // (rounding)
+    return e;
+}
 static int swap_make(void) {
     ANativeWindow *w = dm_front_window();
     if (w != g_win) { swap_destroy(); g_win = w; }
     if (!w) return 0;
     int ww = ANativeWindow_getWidth(w), wh = ANativeWindow_getHeight(w);
-    if (g_swap && ww > 0 && wh > 0 && ((uint32_t)ww != g_sext.width || (uint32_t)wh != g_sext.height)) swap_destroy();
+    if (g_swap && ww > 0 && wh > 0) { VkExtent2D e = swap_extent((uint32_t)ww, (uint32_t)wh); if (e.width != g_sext.width || e.height != g_sext.height) swap_destroy(); }
     if (g_swap) return 1;
     VkAndroidSurfaceCreateInfoKHR si = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, w};
     if (vkCreateAndroidSurfaceKHR(V.inst, &si, NULL, &g_surf)) return 0;
@@ -175,6 +191,7 @@ static int swap_make(void) {
     if (g_sfmt != g_want) VKRED_ONCE(95, "the surface offers no format %d for the window texture: its picture is %s", g_want, g_want == VK_FORMAT_R8G8B8A8_SRGB ? "darker" : "lighter");
     g_sext = (VkExtent2D){(uint32_t)ANativeWindow_getWidth(w), (uint32_t)ANativeWindow_getHeight(w)};   // the window as it is now; Android's compositor rotates (identity transform)
     if (!g_sext.width || !g_sext.height) g_sext = caps.currentExtent;
+    g_wext = g_sext; g_sext = swap_extent(g_wext.width, g_wext.height);   // (DM_VK_SWAP_FIT: the compositor enlarges it to the window)
     uint32_t n = caps.minImageCount < 3 ? 3 : caps.minImageCount; if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
     int want = 1; { const char *e = getenv("DM_VK_PRETRANSFORM"); if (e && *e) want = atoi(e) != 0; }
     VkSurfaceTransformFlagBitsKHR turn = (VkSurfaceTransformFlagBitsKHR)(caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR));
@@ -198,6 +215,7 @@ static int swap_make(void) {
     }
     if (g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) VKLOG("swapchain %ux%u format %d, %u images, pre-rotated (transform %#x; the window %ux%u)", g_next.width, g_next.height, g_sfmt, g_nsimg, (unsigned)g_pre, g_sext.width, g_sext.height);
     else VKLOG("swapchain %ux%u format %d, %u images%s", g_sext.width, g_sext.height, g_sfmt, g_nsimg, turn ? " (the compositor turns the picture)" : "");
+    if (g_sext.width != g_wext.width || g_sext.height != g_wext.height) VKLOG("swapchain fitted to the game's %ux%u picture; the compositor enlarges it to the %ux%u window (DM_VK_SWAP_FIT)", g_fit_w, g_fit_h, g_wext.width, g_wext.height);
     return 1;
 }
 static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to) {
@@ -960,6 +978,12 @@ static void shot(vkimg_t *im, uint64_t n) {
     VKLOG("frame %llu written to %s (%ux%u)", (unsigned long long)n, path, w, h);
 }
 static pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // the swapchain against the window going away (vk_window_lost, on the main thread)
+static int swap_for(const vkimg_t *im, const int *crop) {   // swap_make for this picture (DM_VK_SWAP_FIT: the largest picture so far sizes the swapchain); under g_present_mu
+    uint32_t cw = crop && crop[2] > 0 ? (uint32_t)crop[2] : im->w, ch = crop && crop[3] > 0 ? (uint32_t)crop[3] : im->h;
+    if (dm_front_window() != g_win) g_fit_w = g_fit_h = 0;   // another window: its own pictures
+    if (cw > g_fit_w) g_fit_w = cw; if (ch > g_fit_h) g_fit_h = ch;
+    return swap_make();
+}
 void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
 // The present thread: mtl_present only queues the frame and returns (as on Apple), so the game thread never waits in vkAcquireNextImageKHR or on the
 // swapchain's fences (a FIFO swapchain blocks there until a vsync); the window texture is not drawn again before its blit, because NVN's acquire waits for
@@ -980,12 +1004,12 @@ static void *present_thread(void *arg) {
         atomic_store(&g_redraw, 0);
         if (g_pq_tail == g_pq_head) {   // a redraw, no new frame
             pthread_mutex_unlock(&g_pq_mu);
-            if (last.im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(last.im, last.has_crop ? last.crop : NULL, -1, 0); pthread_mutex_unlock(&g_present_mu); }
+            if (last.im) { pthread_mutex_lock(&g_present_mu); if (swap_for(last.im, last.has_crop ? last.crop : NULL)) present_window(last.im, last.has_crop ? last.crop : NULL, -1, 0); pthread_mutex_unlock(&g_present_mu); }
             continue;
         }
         typeof(g_pq[0]) e = g_pq[g_pq_tail % PQ_N];
         pthread_mutex_unlock(&g_pq_mu);
-        if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); }
+        if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_for(e.im, e.has_crop ? e.crop : NULL)) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); }
         pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }
     return NULL;
@@ -995,7 +1019,7 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
     static int sync = -1; static pthread_once_t once = PTHREAD_ONCE_INIT;
     if (sync < 0) sync = getenv("DM_VK_SYNC_PRESENT") != NULL;
     if (sync || !dm_front_window()) {   // headless: nothing to show; or presenting on this thread
-        if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(im, crop, period, n); pthread_mutex_unlock(&g_present_mu); }
+        if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_for(im, crop)) present_window(im, crop, period, n); pthread_mutex_unlock(&g_present_mu); }
         pthread_mutex_lock(&g_pq_mu); if (g_pq_tail == g_pq_head) g_pq_done = n; pthread_mutex_unlock(&g_pq_mu);   // done at once (after any queued ones)
         return n;
     }
@@ -1045,6 +1069,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
           if (g_gsb_draws > pd2) VKLOG("split geometry draws per frame (last 600): %.1f (%.0f vertices) drawn in %.1f batches (%.1f ended by a write into what a waiting draw reads, %.1f by a full table)",
                                        (g_gsb_draws - pd2) / 600.0, (g_gsb_verts - pv2) / 600.0, (g_gsb_batches - pb2) / 600.0, (g_gsb_wr - pw2) / 600.0, (g_gsb_full - pf2) / 600.0);
           pd2 = g_gsb_draws; pb2 = g_gsb_batches; pw2 = g_gsb_wr; pf2 = g_gsb_full; pv2 = g_gsb_verts; }
+        { extern uint64_t g_vjoin_n, g_vjoin_bytes, g_vjoin_live; static uint64_t pj, pjb;   // gfx_vk_exec.c vbuf_joined
+          if (g_vjoin_n > pj) VKLOG("vertex buffers across a memory pool chunk's end per frame (last 600): %.2f copies, %.2f MB; their buffers %.0f MB", (g_vjoin_n - pj) / 600.0,
+                                    (g_vjoin_bytes - pjb) / 600.0 / 1048576.0, g_vjoin_live / 1048576.0);
+          pj = g_vjoin_n; pjb = g_vjoin_bytes; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }

@@ -1244,6 +1244,7 @@ void (vk_img_barrier_all)(VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, NULL, 0, NULL);
 }
 void vk_gpu_wrote(uint64_t a, uint64_t n);
+void vk_vjoin_wrote(uint64_t a, uint64_t n);   // gfx_vk_exec.c: copies of vertex buffers across a chunk's end made again
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n) return;
@@ -1282,6 +1283,7 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     if (g_nubd == UBD_MAX) vk_sync_end_land_at(__FILE__, __LINE__);   // too many distinct ranges: they land now
     uint8_t *p = vk_scratch(n, 4, &sb, &so); memcpy(p, data, n);
     g_ubd[g_nubd++] = (ubd_t){dst, dst + n, sb, so, p}; g_ubd_gen++;
+    vk_vjoin_wrote(dst, n);
 }
 // the draw bisection (gfx_vk_exec.c draw_allowed): the outcome of this submission
 extern int g_bis_on, g_bis_lo, g_bis_hi, g_bis_trace, g_bis_var; void vk_bisect_reset_count(void);
@@ -1339,6 +1341,7 @@ static void sub_gpu_wrote(uint64_t a, uint64_t n) {   // into the open submissio
     else { s->gw[s->ngw].lo = lo; s->gw[s->ngw].hi = hi; s->ngw++; }
 }
 void vk_gpu_wrote(uint64_t a, uint64_t n) {
+    vk_vjoin_wrote(a, n);
     uint64_t f = g_fence + 1;
     for (int i = g_ngw - 1; i >= 0 && g_gw[i].fence == f; i--) if (g_gw[i].lo <= a && a + n <= g_gw[i].hi) return;
     if (g_ngw == GW_MAX) { uint64_t done = vk_fence_done(); int o = 0; for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence > done) g_gw[o++] = g_gw[i]; g_ngw = o; }

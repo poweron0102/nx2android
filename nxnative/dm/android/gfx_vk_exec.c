@@ -1342,21 +1342,34 @@ static void vk_cross(int k, uint64_t a, uint64_t n, const vkpool_t *p) {
 // +0x11ba30 at the first; a copy per bound range took the scratch memory of every draw, and the system killed the app for its memory twice on a Xiaomi Pad 7). The copy
 // goes into a buffer of the address's own, kept from submission to submission: in scratch memory each submission in flight held one (6 x 19 MB, the scratch at 162 MB
 // instead of 48). A barrier before the copy waits for the earlier submissions' draws that read the buffer. A buffer not used for VJ_IDLE submissions goes (vbuf_join_trim).
-// DM_VK_VBUF_JOIN=0 (live): bound from the first chunk as before
+// The copy is made again only when the range may have changed since: a CPU write (its pages write-protected after the copy, nvn_dirty), a GPU write into it (vk_vjoin_wrote:
+// copies, fills, constant buffer updates, transform feedback, render targets in buffer memory, and every storage buffer or storage texel buffer bound in any stage, taken as
+// written), or a pool added or removed. Copied at every submission, the tower's 19 MB took 2.3 ms of GPU time a frame on a Poco F5 (GPU 34.2 -> 36.5 ms, frame 35 -> 38.5 ms).
+// DM_VK_VBUF_JOIN=0 (live): bound from the first chunk as before; =2: copied at every submission
 enum { VJ_N = 16, VJ_IDLE = 600 };
-static struct { uint64_t a, n, most, cap, ep; VkBuffer b; VkDeviceMemory m; } g_vj[VJ_N];   // most: the longest range bound at a; cap: the buffer's size; ep: the submission it was last filled in
-uint64_t g_vjoin_n, g_vjoin_bytes, g_vjoin_live;   // copies made and their bytes, the buffers' bytes now (gfx_vk_present.c's line every 600 presents)
+// most: the longest range bound at a; cap: the buffer's size; ep: the submission it was last filled or found unchanged in; wep: 1 + the submission of the last GPU write into
+// [a, a + most) (a copy holds what submissions before its own wrote); stamp, span: the dirty-page generation after the pages were protected, and their tracked range; gen: vk_pool_gen then
+static struct { uint64_t a, n, most, cap, ep, wep, stamp; const void *span; uint32_t gen; VkBuffer b; VkDeviceMemory m; } g_vj[VJ_N];
+uint64_t g_vjoin_n, g_vjoin_bytes, g_vjoin_live, g_vjoin_kept;   // copies made and their bytes, the buffers' bytes now, submissions that found a copy unchanged (gfx_vk_present.c's line every 600 presents)
 static void vj_free(int k) {
     if (g_vj[k].b) { vk_defer_free_buffer(g_vj[k].b, g_vj[k].m); g_vjoin_live -= g_vj[k].cap; }
     memset(&g_vj[k], 0, sizeof g_vj[k]);
 }
 static void vbuf_join_trim(void) { for (int k = 0; k < VJ_N; k++) if (g_vj[k].b && g_set_epoch - g_vj[k].ep > VJ_IDLE) vj_free(k); }
+void vk_vjoin_wrote(uint64_t a, uint64_t n) {   // the GPU writes [a, a + n) in this submission (n = 0: to an unknown length)
+    uint64_t hi = n && a + n > a ? a + n : ~0ull;
+    for (int k = 0; k < VJ_N; k++) if (g_vj[k].b && a < g_vj[k].a + g_vj[k].most && g_vj[k].a < hi) g_vj[k].wep = g_set_epoch + 1;
+}
+void nvn_dirty_protect(const void *addr, size_t len); uint64_t nvn_dirty_now(void); const void *nvn_dirty_span(const void *addr, size_t len); uint32_t vk_pool_gen(void);
+int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);
 static void vbuf_joined(uint64_t a, uint64_t n, const vkpool_t *p, VkBuffer *buf, VkDeviceSize *off) {
-    { const char *e = getenv("DM_VK_VBUF_JOIN"); if (e && !atoi(e)) return; }
+    int mode = 1; { const char *e = getenv("DM_VK_VBUF_JOIN"); if (e) mode = atoi(e); } if (!mode) return;
     if (a + n > p->end) n = p->end - a;
     int k = -1; for (int i = 0; i < VJ_N; i++) if (g_vj[i].a == a && g_vj[i].b) { k = i; break; }
     if (k < 0) { k = 0; for (int i = 1; i < VJ_N; i++) if (g_vj[i].ep < g_vj[k].ep) k = i; vj_free(k); g_vj[k].a = a; }   // (the entry used the longest ago)
     if (g_vj[k].b && g_vj[k].ep == g_set_epoch && g_vj[k].n >= n) { *buf = g_vj[k].b; *off = 0; return; }
+    if (mode == 1 && g_vj[k].b && g_vj[k].n >= n && g_vj[k].span && g_vj[k].wep <= g_vj[k].ep && g_vj[k].gen == vk_pool_gen() &&
+        !nvn_dirty_since_span(g_vj[k].span, (const void *)(uintptr_t)a, g_vj[k].n, g_vj[k].stamp)) { g_vj[k].ep = g_set_epoch; g_vjoin_kept++; *buf = g_vj[k].b; *off = 0; return; }
     if (n < g_vj[k].most) n = g_vj[k].most; else g_vj[k].most = n;
     if (g_vj[k].cap < n) {   // (a larger range: a larger buffer, the old one freed after the submissions that read it)
         uint64_t most = g_vj[k].most; vj_free(k); g_vj[k].a = a; g_vj[k].most = most;
@@ -1367,6 +1380,7 @@ static void vbuf_joined(uint64_t a, uint64_t n, const vkpool_t *p, VkBuffer *buf
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
         if (vkAllocateMemory(V.dev, &ai, NULL, &g_vj[k].m)) { vkDestroyBuffer(V.dev, g_vj[k].b, NULL); g_vj[k].b = VK_NULL_HANDLE; VKRED_ONCE(122, "vertex buffer across a memory pool chunk's end: no memory for its copy"); return; }
         VKCHK(vkBindBufferMemory(V.dev, g_vj[k].b, g_vj[k].m, 0)); g_vj[k].cap = cap; g_vjoin_live += cap;
+        g_vj[k].wep = g_set_epoch + 1;   // (GPU writes earlier in this submission went unseen: copied once more at the next)
     }
     VkCommandBuffer cb = vk_upload_cmd();
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};   // after every read of it so far
@@ -1376,6 +1390,8 @@ static void vbuf_joined(uint64_t a, uint64_t n, const vkpool_t *p, VkBuffer *buf
         uint64_t e = q->hi < a + n ? q->hi : a + n; VkBufferCopy r = {x - q->lo + q->boff, x - a, e - x};
         vkCmdCopyBuffer(cb, q->buf, g_vj[k].b, 1, &r); x = e;
     }
+    const void *m = (const void *)(uintptr_t)a; nvn_dirty_protect(m, n);   // (the copy runs on the GPU later: CPU writes from here on count as changes, which only copies once more)
+    g_vj[k].stamp = nvn_dirty_now(); g_vj[k].span = nvn_dirty_span(m, n); g_vj[k].gen = vk_pool_gen();
     g_vj[k].n = n; g_vj[k].ep = g_set_epoch; *buf = g_vj[k].b; *off = 0; g_vjoin_n++; g_vjoin_bytes += n;
 }
 // a constant buffer binding's descriptor (stage_set, set_memo_get): its pool's buffer from the alignment boundary below it, or the shadow of the deferred updates over it
@@ -1483,6 +1499,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
                 const VkDeviceSize al = SB_ALIGN; if (V.props.limits.minStorageBufferOffsetAlignment > al) VKRED_ONCE(41, "storage buffer alignment %llu above %llu", (unsigned long long)V.props.limits.minStorageBufferOffsetAlignment, (unsigned long long)al);
                 bi[nw] = (VkDescriptorBufferInfo){buf, p->boff + off - off % al, n + off % al};
                 if (st == 5 && b->kind != RK_UBO_PTR) { void vk_gpu_wrote(uint64_t a, uint64_t n); vk_gpu_wrote(a, n); }   // a dispatch's storage buffers: taken as written
+                else if (b->kind != RK_UBO_PTR) vk_vjoin_wrote(a, n);   // a draw's too, for vbuf_joined (geometry and fragment shaders write storage buffers)
             } else bi[nw] = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536};
             break; }
         case RK_TEX: case RK_TEX_UBO: case RK_TEX_C2A: {
@@ -1536,6 +1553,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             bv[nw] = tid && vk_tex_by_id(tid, &v, &t) && t && t->d.target == NVN_TEXTURE_TARGET_BUFFER ? vk_tbuf_view(t, b->kind == RK_IMG_TBUF) : VK_NULL_HANDLE;
             if ((g_tracing && g_x_tracepass >= 0) || (st == 5 && g_x_tracepass == -2)) VKLOG("  texel buffer binding %d (kind %d, cbuf %d +%d): handle %#llx → %s format %#x, %u elements at %#llx%s", b->binding, b->kind, b->reg, b->off,
                 (unsigned long long)h, t ? "texture" : "no texture", t ? t->d.format : 0, t ? t->d.width : 0, t ? (unsigned long long)(uintptr_t)t->mem : 0ull, bv[nw] ? "" : " (the dummy: zeros)");
+            if (bv[nw] && b->kind == RK_IMG_TBUF) { const vkfmt_t *f = vk_fmt(t->d.format); vk_vjoin_wrote((uint64_t)(uintptr_t)t->mem, f ? (uint64_t)t->d.width * f->bpb : 0); }   // (vbuf_joined)
             if (!bv[nw]) bv[nw] = vk_dummy_tbuf(b->kind == RK_IMG_TBUF);
             else if (i < 64) { int num = view_num(t, NULL); if (num == 1) g_num_um |= 1ull << i; else if (num == 2) g_num_im |= 1ull << i; }   // texel buffers read and write their words alike (storage ones too: gfx_vk_shader.c spv_int_images)
             wr->pTexelBufferView = &bv[nw]; wr->descriptorType = b->kind == RK_IMG_TBUF ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; nw++;

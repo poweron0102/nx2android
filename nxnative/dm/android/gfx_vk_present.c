@@ -1069,10 +1069,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
           if (g_gsb_draws > pd2) VKLOG("split geometry draws per frame (last 600): %.1f (%.0f vertices) drawn in %.1f batches (%.1f ended by a write into what a waiting draw reads, %.1f by a full table)",
                                        (g_gsb_draws - pd2) / 600.0, (g_gsb_verts - pv2) / 600.0, (g_gsb_batches - pb2) / 600.0, (g_gsb_wr - pw2) / 600.0, (g_gsb_full - pf2) / 600.0);
           pd2 = g_gsb_draws; pb2 = g_gsb_batches; pw2 = g_gsb_wr; pf2 = g_gsb_full; pv2 = g_gsb_verts; }
-        { extern uint64_t g_vjoin_n, g_vjoin_bytes, g_vjoin_live; static uint64_t pj, pjb;   // gfx_vk_exec.c vbuf_joined
-          if (g_vjoin_n > pj) VKLOG("vertex buffers across a memory pool chunk's end per frame (last 600): %.2f copies, %.2f MB; their buffers %.0f MB", (g_vjoin_n - pj) / 600.0,
-                                    (g_vjoin_bytes - pjb) / 600.0 / 1048576.0, g_vjoin_live / 1048576.0);
-          pj = g_vjoin_n; pjb = g_vjoin_bytes; }
+        { extern uint64_t g_vjoin_n, g_vjoin_bytes, g_vjoin_live, g_vjoin_kept; static uint64_t pj, pjb, pk;   // gfx_vk_exec.c vbuf_joined
+          if (g_vjoin_n > pj || g_vjoin_kept > pk) VKLOG("vertex buffers across a memory pool chunk's end per frame (last 600): %.2f copies, %.2f MB, %.2f found unchanged; their buffers %.0f MB",
+                                    (g_vjoin_n - pj) / 600.0, (g_vjoin_bytes - pjb) / 600.0 / 1048576.0, (g_vjoin_kept - pk) / 600.0, g_vjoin_live / 1048576.0);
+          pj = g_vjoin_n; pjb = g_vjoin_bytes; pk = g_vjoin_kept; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }

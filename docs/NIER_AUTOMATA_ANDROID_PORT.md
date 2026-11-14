@@ -51,8 +51,10 @@ stability are not validated. This is an experimental bring-up, not a playable cl
 - **Once-only geometry effects on Adreno.** Three-output software geometry
   passthrough appended each visible triangle three times on both Turnip and the
   Qualcomm driver, overflowing the following mesh's index range. Separate a
-  discarded, single-point memory pass from a pure raster pass, with a barrier
-  between them. Scalarize guest subgroup operations only in the effects pass.
+  one-invocation memory pass that outputs nothing from a pure raster pass, with a
+  barrier between them. Scalarize guest subgroup operations only in the effects pass.
+  Consecutive split draws are batched into one effects pass and one raster pass,
+  and the effects run without rasterizer discard (see the performance record).
   A conservative data-flow check requires raster outputs and control flow to be
   independent of mutable buffers. Direct eligible draws use the workaround by
   default on Adreno; `DM_VK_GS_SPLIT=0` provides a live A/B. Original depth
@@ -123,6 +125,53 @@ the short stationary timing sample.
   (Windows exit 9009). That packaging test passed separately when `python3` was
   resolved to the current venv interpreter. The new geometry harness ran on
   Android despite the host-compiler skip in the Python suite.
+
+### Geometry-effects performance, 2026-11-12 and 2026-11-13
+
+Poco F5 (Snapdragon 7+ Gen 2, Adreno 725), Turnip v26 R8, docked profile
+(1920x1080), stationary at the Desert Zone access point, validation off. The
+depth pre-pass culls with a geometry shader in about 220 draws a frame (1.33 M
+vertices); the split drew each as two passes with their barriers and transfers,
+436 of the frame's 478 passes.
+
+- **Batch.** Consecutive split draws share one effects pass and one raster pass
+  (`DM_VK_GS_BATCH`, on by default). All 220 draws form one batch a frame.
+- **Effects without rasterizer discard.** With per-pass GPU timestamps, the
+  effects pass took 11.2 ms a frame as one discarded point per primitive, 10.0 ms
+  with no output under discard, and 3.0 ms with no output and no discard. The
+  raster pass of the same draws takes 3.8 ms; its own shader module drawn under
+  discard in the effects pass took 11.4 ms, and drawing those effects twice took
+  22.9 ms. Removing the effects' buffer writes changed little under discard
+  (10.6 ms). The cost follows the rasterizer-discard pipeline state, not the
+  culling shader. Turnip's forced sysmem mode changed nothing and forced gmem
+  made the frame slower. `DM_VK_GS_FX_DISCARD=1` restores the discarded point.
+
+One launch, switches toggled live in interleaved 25-second windows (about 850
+frames each), GPU time per frame from the host's own timestamps:
+
+| Configuration | GPU p50 (ms) | GPU p95 (ms) | Frames in 25 s |
+|---|---|---|---|
+| Before: one draw at a time, discarded point | 36.3 | 38.0 | 757 |
+| Batch only (`DM_VK_GS_FX_DISCARD=1`) | 31.8-32.1 | 33.5-33.7 | 833-852 |
+| No discard only (`DM_VK_GS_BATCH=0`) | 27.9 | 29.5 | 854 |
+| Both (default), five windows | 23.9-24.2 | 31.0-32.0 | 836-863 |
+
+The game's 30 fps limit now holds in this scene (mean frame time 33.4 ms, was
+37.9 ms). Presents needing a resynchronization against the display's vsync grid
+fell from about 28% to 3%. These are measurements of one stationary scene on
+one device and driver: they do not establish frame rates elsewhere in the game.
+
+- Screenshots of every window showed the scene intact (dark-pixel fraction 0%
+  in the distant-rock ROI used above); the main colour pass, which draws from
+  the index buffers the effects write, kept its cost and content.
+- The Android NDK harness ran 63 synthetic cases, now including the no-output
+  effects form for every fixture. The game's two culling shaders produced three
+  modules each that passed `spirv-val --target-env vulkan1.1`.
+- A run under the validation layer covering the default, `DM_VK_GS_BATCH=0`
+  and `DM_VK_GS_FX_DISCARD=1` produced zero VUIDs. It warned that a fragment
+  shader writes colour outputs its pass has no attachment for.
+- Not established: movement and camera rotation with the final build, other
+  areas, long sessions, and other Adreno games that use the split.
 
 ### Integration checks, 2026-11-10
 

@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
     for (int kind = 0; kind <= 19; kind++) {
         fixture(kind); uint32_t original[4096]; memcpy(original, w, nw * 4);
         int accepted = kind == 0 || kind == 8 || kind == 11 || kind == 12 || kind == 15 || kind == 18;
-        for (int mode = 1; mode <= 2; mode++) {
+        for (int mode = 1; mode <= 3; mode++) {
             uint32_t n = 123, *p = spv_gs_split(w, nw, mode, &n, why, sizeof why);
             assert((p != NULL) == accepted); assert(!memcmp(original, w, nw * 4));
             if (!accepted) { assert(n == 0 && why[0]); checks++; continue; }
@@ -95,6 +95,10 @@ int main(int argc, char **argv) {
                 assert(count(p, n, 234) == 1); assert(count(p, n, 218) == 1);
                 assert(mode_value(p, n, 26) == 1 && mode_value(p, n, 27));
                 assert(count(p, n, 17) == (kind >= 16 ? 5 : 3)); // PointSize capability exactly once.
+            } else if (mode == 3) { // The effects alone: the atomic stays, nothing is emitted, and the output primitive and capabilities are the original's.
+                assert(count(p, n, 234) == 1); assert(count(p, n, 218) == 0 && count(p, n, 219) == 0);
+                assert(mode_value(p, n, 26) == 1 && mode_value(p, n, 29) && !mode_value(p, n, 27));
+                assert(count(p, n, 17) == count(w, nw, 17) && n < nw);
             } else {
                 assert(count(p, n, 234) == 0); assert(count(p, n, 218) == 3);
                 assert(mode_value(p, n, 26) == 3 && mode_value(p, n, 29));
@@ -113,6 +117,6 @@ int main(int argc, char **argv) {
     fixture(0); uint32_t n;
     uint32_t saved = w[5]; w[5] = 0; assert(!spv_gs_split(w, nw, 1, &n, why, sizeof why)); w[5] = saved; checks++;
     assert(!spv_gs_split(w, 4, 1, &n, why, sizeof why)); checks++;
-    assert(!spv_gs_split(w, nw, 3, &n, why, sizeof why)); checks++;
-    puts("geometry split: 43 cases passed"); assert(checks == 43); return 0;
+    assert(!spv_gs_split(w, nw, 4, &n, why, sizeof why)); checks++;
+    puts("geometry split: 63 cases passed"); assert(checks == 63); return 0;
 }

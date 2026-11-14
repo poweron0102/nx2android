@@ -20,7 +20,7 @@ class GeometrySplit(unittest.TestCase):
                             str(ROOT / 'nxnative/dm/android/gfx_vk_gs_split.c'), '-o', str(exe)],
                            check=True, capture_output=True)
             result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
-            self.assertIn('43 cases passed', result.stdout)
+            self.assertIn('63 cases passed', result.stdout)
 
 
 if __name__ == '__main__':

@@ -83,7 +83,26 @@ uint64_t vk_replay_ns(void) { return g_vkst.ns_exec; }   // the replay time so f
 // flicker experiments (DM_CTL env lines, read every submission): DM_VK_X_NOSETC no descriptor set reuse, DM_VK_X_NODRVC no driver segment reuse, DM_VK_X_LANDCUT deferred
 // uniform updates land at each cut, DM_VK_X_NOKEEP no pass kept for the same targets, DM_VK_X_NOSHC no shadow reuse
 static int g_fdz = 1;  // DM_VK_FDZ (live): fragment-depth variants for draws on depth written by fragment shaders (pipeline key fdz)
-static int g_gs_split_mode; // 1: discarded, single-output memory pass; 2: pure rasterization
+static int g_gs_split_mode; // the split draw being replayed (spv_gs_split's modes): 1 its effects as one discarded point, 3 its effects without output; 2 its rasterization
+// A split draw's effects are drawn by the geometry shader variant that outputs nothing, without rasterizer discard (gs_fx): nothing reaches the rasterizer either way,
+// and Turnip on Adreno 725 runs the geometry stages of a rasterizer-discard pipeline at about three times the cost. NieR:Automata's 220 effects draws (1.33 M vertices)
+// took 11.2 ms a frame as one discarded point each, 10.0 ms as no output under discard, 3.0 ms as no output without discard; the same draws' rasterization takes 3.8 ms,
+// and its module drawn under discard in the effects pass 11.4 ms (twice: 22.9 ms). GPU p50 32.0 -> 23.9 ms a frame. Those draws still count as a run of rasterizer
+// discard (prepare_draw): a pass of their own, never built late, the read where they end. DM_VK_GS_FX_DISCARD=1 (live, A/B): one discarded point, as before
+static int g_gs_fx_discard;
+// Consecutive split draws as one batch (gsb_join, gsb_flush): their effects draws share one pass and their rasterization, recorded as Vulkan handles when
+// each draw is replayed, is drawn in one pass when that pass ends. NieR:Automata's depth pre-pass culls with a geometry shader in ~220 draws a frame: two passes, eight
+// barriers and two transfer touches a draw were 436 of its 478 passes (Poco F5, Adreno 725, Turnip: GPU p50 36.0 ms a frame). DM_VK_GS_BATCH=0 (live): one draw at a time
+enum { GSB_MAX = 512, GSB_DOFS = 8192, GSB_W = 8, GSB_R = 8192 };
+typedef struct { float vp[4], dnear, dfar, blendc[4]; uint8_t vp_sw[4]; p_scissor sc; int sc_set, sref[2], smask[2], swmask[2]; p_poly_offset pofs; } gsb_dyn;   // what set_dynamic reads of the NVN state
+typedef struct { VkPipeline p; VkPipelineLayout lay; VkDescriptorSet sets[5]; uint32_t nsets, ndofs, dofs_at, at[6], nvb, indexed, count, inst, first, binst, variant, topo; int32_t vofs; int ok;
+                 struct { uint32_t b; VkBuffer buf; VkDeviceSize off; } vb[34]; VkBuffer ib; VkDeviceSize io; VkIndexType it; gsb_dyn dyn; uint64_t keys[3]; } gsb_draw;
+static struct { int n, nr, r0; uint32_t ndofs; uint64_t rlo, rhi, r[GSB_R][2]; uint16_t rc[256]; gsb_draw d[GSB_MAX]; uint32_t dofs[GSB_DOFS]; } g_gsb;   // n: rasterization draws waiting for the open effects pass's end; r: the buffer ranges they read (rlo..rhi around them all, r0: where the draw being replayed's begin, rc: where a range was last put)
+static gsb_draw *g_gsb_cap;   // the draw being replayed is recorded here, not into the command buffer (a batch's rasterization)
+static vkshader_t *g_gsb_gs;   // the geometry shader variant gs_split_draw last accepted
+static int g_gs_batch = 1, g_gsb_fx;   // g_gsb_fx: the draw being replayed is a batch's effects draw
+uint64_t g_gsb_draws, g_gsb_batches, g_gsb_wr, g_gsb_full, g_gsb_verts;   // split draws batched, batches drawn, batches ended by a write into what a waiting draw reads and by a full table (gfx_vk_present.c reports them)
+static void gsb_flush(void);
 enum { LRZ_READ = 2, LRZ_SWITCH = 4, LRZ_CUT = 8, LRZ_ALL = 14, LRZ_CUT_RD = 16, LRZ_CORNER = 32 };   /* LRZ_CUT_RD: only read at a cut; LRZ_CORNER: the last texel, not the first (tests) */   // DM_VK_LRZ_TOUCH bits: the read before a load pass, the write-back on a depth switch, the write-back at a cut
 static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt, g_x_nodispbar; int g_x_noshc;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
 static int g_x_nosetmemo, g_x_setverify;   // DM_VK_X_NOSETMEMO=1 (live, A/B): no per-stage set memo; DM_VK_X_SETVERIFY=1 (live): one memo hit in 64 checked (see stage_set)
@@ -173,7 +192,8 @@ static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
     g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
-    g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
+    g_gs_batch = !((e = getenv("DM_VK_GS_BATCH")) && !atoi(e)); g_gs_fx_discard = (e = getenv("DM_VK_GS_FX_DISCARD")) && atoi(e);
+    g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound =!((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
     g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; } }
 // ---------------- conditional rendering (profile render_cond) ----------------
 // As nvn_mtl.m (OP_RENDER_COND): SetRenderEnableConditional draws while the 64-bit counters of the reports at addr and addr + 16 are equal / differ, until SetRenderEnable(true).
@@ -207,6 +227,7 @@ void vk_exec_reset(void) {   // a new submission: NVN state does not carry over 
     static int inited; if (!inited) { inited = 1; state_reset(); crash_add_note_hook(build_dump); prewarm_start(); compute_warm_start(); }
     g_rc_npend = 0; g_rc_skip = 0;
     { void vk_tex_release_drain(void); vk_tex_release_drain(); }   // Finalized textures' CPU-written marks that no queued job needs any more (gfx_vk_tex.c)
+    if (g_gsb.n) { VKRED_ONCE(113, "a submission ended with %d batched rasterization draws not drawn", g_gsb.n); g_gsb.n = 0; }   // (every pass end draws them: not expected)
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
     { extern volatile int g_vk_samp_log; if (g_vk_samp_log > 0) VKLOG("submission begins (present %llu, thread %d)", (unsigned long long)g_tex_frame, (int)gettid()); }
@@ -595,6 +616,7 @@ void vk_end_pass(void) {
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+    if (g_gsb.n) gsb_flush();   // the ended pass held a batch's effects draws: their rasterization, in a pass of its own, before whatever ended it
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
@@ -771,6 +793,7 @@ static int clear_masked(const p_clear_color *c, VkRect2D r) {   // 1 = done
     return 1;
 }
 static void clear_color(const p_clear_color *c) {
+    if (g_gsb.n) vk_sync_end_at(__FILE__, __LINE__);   // a clear follows the batch's rasterization
     if (!begin_pass()) return;
     if (c->index < 0 || c->index >= S.ncol) return;
     p_clear_color mapped=*c;mapped.index=P_alias[c->index];c=&mapped;
@@ -793,6 +816,7 @@ static void clear_color(const p_clear_color *c) {
     if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(vk_cmd(), 1, &a, 1, &r);
 }
 static void clear_ds(const p_clear_ds *c) {
+    if (g_gsb.n) vk_sync_end_at(__FILE__, __LINE__);   // (clear_color)
     if (!begin_pass() || !S.daspect) return;
     VkImageAspectFlags as = (c->depth_mask ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (c->stencil_mask && (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     as &= S.daspect; if (!as) return;
@@ -942,7 +966,7 @@ static void *async_pipe_thread(void *arg) {
     return NULL;
 }
 static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); under nothing (takes g_pipe_mu)
-    if (!g_async_pipe || k->raster_discard || (S.sh[0] && S.sh[0]->xfb) || (S.sh[2] && S.sh[2]->xfb)) return 0;
+    if (!g_async_pipe || k->raster_discard || k->gs_split == 3 || (S.sh[0] && S.sh[0]->xfb) || (S.sh[2] && S.sh[2]->xfb)) return 0;
     for (int i = 0; i < S.ncol && i < 8; i++) if (S.rt_has_col[i] && (S.rt_col[i].d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;   // (the CPU reads it: lin_back)
     int natt = 0; for (int i = 0; i < 9; i++) { const vkimg_t *a = P_att[i].im; if (!a) continue; natt++; if (a->rt_frames < 3) {
             if (g_prof_on) { static int n; if (n++ < 300) VKLOG("pipeline built here: attachment %d %ux%u nvn format %#x drawn in %llu presents in a row (shaders %016llx %016llx)", i, a->w, a->h, a->nvn_format, (unsigned long long)a->rt_frames, (unsigned long long)k->key[0], (unsigned long long)k->key[1]); }
@@ -1056,7 +1080,7 @@ static void build_dump(void) {   // (the crash handler: no locks, no allocation)
 }
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in[3]) {
     VkPipeline p; vkshader_t *stg[3] = {stg_in[0], stg_in[1], stg_in[2] ? vk_shader_gs_topo(stg_in[2], (VkPrimitiveTopology)k->topo) : NULL};
-    if (k->gs_split && (k->gs_split > 2 || !stg[2] || !vk_shader_gs_split_ready(stg[2]))) return (VkPipeline)1;
+    if (k->gs_split && (k->gs_split > 3 || !stg[2] || !vk_shader_gs_split_ready(stg[2]))) return (VkPipeline)1;
     int bs = build_begin();
     if (bs >= 0) { snprintf(g_build[bs].what, sizeof g_build[bs].what, "graphics pipeline, shaders %016llx %016llx %016llx; topology %u, polygon mode %u, samples %u, "
             "%u colour targets (formats %u %u %u %u), depth format %u; raster discard %u, fragment depth variant %u, dual source %u, transform feedback %d, logic op %u, "
@@ -1541,8 +1565,13 @@ static struct { uint64_t gen; VkViewport vp; VkRect2D sc; float bc[4]; int sm[2]
 static int bc_fresh(void) { if (g_bc.gen != g_cmd_gen || g_x_nobc || g_bc_stale) { g_bc_stale = 0; memset(&g_bc, 0, sizeof g_bc); g_bc.gen = g_cmd_gen; g_bc.it = (VkIndexType)-1; return 1; } return 0; }
 #define BC_SAME(field, val) (!fresh && !memcmp(&g_bc.field, &(val), sizeof g_bc.field))
 static void bc_index(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t) {
+    if (g_gsb_cap) { g_gsb_cap->ib = b; g_gsb_cap->io = o; g_gsb_cap->it = t; return; }
     int fresh = bc_fresh(); if (!fresh && g_bc.ib == b && g_bc.io == o && g_bc.it == t) return;
     vkCmdBindIndexBuffer(cb, b, o, t); g_bc.ib = b; g_bc.io = o; g_bc.it = t;
+}
+static void bc_vbuf(VkCommandBuffer cb, uint32_t b, VkBuffer buf, VkDeviceSize off) {
+    if (g_gsb_cap) { gsb_draw *e = g_gsb_cap; if (e->nvb < sizeof e->vb / sizeof *e->vb) e->vb[e->nvb++] = (typeof(e->vb[0])){b, buf, off}; else e->ok = -1; return; }   // (in order: a later one for the same binding wins)
+    int fresh = bc_fresh(); if (fresh || g_bc.vb[b] != buf || g_bc.vo[b] != off) { vkCmdBindVertexBuffers(cb, b, 1, &buf, &off); g_bc.vb[b] = buf; g_bc.vo[b] = off; }
 }
 static void set_dynamic(VkCommandBuffer cb) {
     int fresh = bc_fresh();
@@ -1589,6 +1618,12 @@ static void rd_read(const uint64_t *a, int n) {
         int dup = 0; for (int j = 0; j < ns; j++) dup |= seen[j] == b; if (dup) continue; seen[ns++] = b;
         vk_scratch(4, 4, &db, &dof); VkBufferCopy r = {o, dof, 4}; vk_img_barrier_all(cb); vkCmdCopyBuffer(cb, b, db, 1, &r); vk_img_barrier_all(cb); }
 }
+static int g_rd_prev, g_rd_nwa; static uint64_t g_rd_wa[16];   // the last draw's rasterizer discard, and the storage buffers of its run's vertex stages (prepare_draw)
+static void rd_note(void) {   // a draw of a run of rasterizer discard
+    if (!g_rd_prev) g_rd_nwa = 0;
+    for (int r = 0; r < 16 && g_rd_nwa < 16; r++) { uint64_t x = S.ssbo[0][r].addr; int have = 0; for (int i = 0; i < g_rd_nwa; i++) have |= g_rd_wa[i] == x; if (x && !have) g_rd_wa[g_rd_nwa++] = x; }
+    g_rd_prev = 1;
+}
 // everything a draw needs bound; 0 when the draw cannot be done (logged once per reason)
 // A shader that writes memory: a store through a pointer into a storage buffer, a uniform block (only BufferBlock storage can be written) or an image, an image write, an
 // atomic other than a load, a memory copy into such a pointer (SPIR-V scanned once). Without its SPIR-V: assumed to write
@@ -1619,9 +1654,31 @@ static int order_feedback(int nst) {   // a stage of the draw samples one of the
     }
     return 0;
 }
+// DM_VK_SETSPLIT=1 (live): under the same layout, only the run of sets whose handle or dynamic offsets changed is bound again. Adreno's vkCmdBindDescriptorSets
+// took ~22% of the replay thread on Unicorn Overlord's battle map (one load in it), and a draw that moves only its vertex stage's offsets sent the fragment set too
+static void gsb_dyn_get(gsb_dyn *d) {   // what set_dynamic reads of the NVN state (keep the two together)
+    memcpy(d->vp, S.vp[0], sizeof d->vp); d->dnear = S.dnear; d->dfar = S.dfar; memcpy(d->blendc, S.blendc, sizeof d->blendc); memcpy(d->vp_sw, S.vp_sw[0], 4); d->sc = S.sc; d->sc_set = S.sc_set;
+    memcpy(d->sref, S.sref, sizeof S.sref); memcpy(d->smask, S.smask, sizeof S.smask); memcpy(d->swmask, S.swmask, sizeof S.swmask); d->pofs = S.pofs;
+}
+static void gsb_dyn_set(const gsb_dyn *d) {
+    memcpy(S.vp[0], d->vp, sizeof d->vp); S.dnear = d->dnear; S.dfar = d->dfar; memcpy(S.blendc, d->blendc, sizeof d->blendc); memcpy(S.vp_sw[0], d->vp_sw, 4); S.sc = d->sc; S.sc_set = d->sc_set;
+    memcpy(S.sref, d->sref, sizeof S.sref); memcpy(S.smask, d->smask, sizeof S.smask); memcpy(S.swmask, d->swmask, sizeof S.swmask); S.pofs = d->pofs;
+}
+static void bc_sets(VkCommandBuffer cb, VkPipelineLayout layout, int nsets, const VkDescriptorSet *sets, uint32_t ndofs, const uint32_t *dall, const uint32_t *at) {
+    if (!(dbg_draw() & 4) && g_setsplit && !bc_fresh() && g_bc.lay == layout && g_bc.nsets == (uint32_t)nsets && g_bc.ndofs == ndofs) {
+        int lo = -1, hi = -1;
+        for (int i = 0; i < nsets; i++) if (g_bc.sets[i] != sets[i] || memcmp(g_bc.dofs + at[i], dall + at[i], sizeof *dall * (at[i + 1] - at[i]))) { if (lo < 0) lo = i; hi = i; }
+        if (lo >= 0) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, (uint32_t)lo, (uint32_t)(hi - lo + 1), sets + lo, at[hi + 1] - at[lo], dall + at[lo]);
+            memcpy(g_bc.sets + lo, sets + lo, sizeof *sets * (size_t)(hi - lo + 1)); memcpy(g_bc.dofs + at[lo], dall + at[lo], sizeof *dall * (at[hi + 1] - at[lo])); } }
+    else if (!(dbg_draw() & 4)) { int fresh = bc_fresh();
+        if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets, sets, sizeof *sets * (size_t)nsets) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, (uint32_t)nsets, sets, ndofs, dall);
+            g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
+}
 static int prepare_draw(int prim, int indexed) {
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
+    if (g_gsb.n && !g_gsb_cap && !g_gsb_fx) vk_sync_end_at(__FILE__, __LINE__);   // any draw outside the batch follows the batch's rasterization (gsb_flush)
     g_cb_draws++;   // the cut itself happens between passes (begin_pass); inside one only with DM_VK_PASS_SPLIT (below): a pass cut in two stores and reloads its attachments
     g_tracing = g_draw_i == g_bis_trace && g_bis_trace >= 0;
     // the change being tried applies to the found draw and every later one (the later draws are refused too: changing one draw alone proves nothing)
@@ -1648,10 +1705,11 @@ static int prepare_draw(int prim, int indexed) {
     // vertex shader drawing the pre-pass too changed nothing), and a full GPU wait after each submission, explicit barrier bits or a barrier to vertex input
     // did not help; drawing from a copy of the records did, as did a command buffer cut or a transfer read of the written buffer at either end of the run.
     // About +0.45 ms of GPU a frame, 33.2 ms frames held. DM_VK_RD_TOUCH=0 (live, A/B): no read
-    { static int prev; static uint64_t wa[16]; static int nwa; int rd = S.rast_discard; if (!g_x_rdkeep && rd != prev && S.pass_open) vk_sync_end_at(__FILE__, __LINE__);
-      if (rd) { if (!prev) nwa = 0; for (int r = 0; r < 16 && nwa < 16; r++) { uint64_t x = S.ssbo[0][r].addr; int have = 0; for (int i = 0; i < nwa; i++) have |= wa[i] == x; if (x && !have) wa[nwa++] = x; } }
-      else if (prev && g_rd_touch && !S.pass_open) rd_read(wa, nwa);
-      prev = rd; }
+    // A split draw's effects without output (g_gs_split_mode 3) are such a run too, though nothing is discarded: the same pass of their own and the same read.
+    // A batch's rasterization (g_gsb_cap) is recorded while its effects pass is open and drawn by gsb_flush, which makes this run's end and its read itself
+    if (!g_gsb_cap) { int rd = S.rast_discard || g_gs_split_mode == 3; if (!g_x_rdkeep && rd != g_rd_prev && S.pass_open) vk_sync_end_at(__FILE__, __LINE__);
+      if (rd) rd_note();
+      else { if (g_rd_prev && g_rd_touch && !S.pass_open) rd_read(g_rd_wa, g_rd_nwa); g_rd_prev = 0; } }
     // DM_VK_PASS_SPLIT=n (live, 0 = off): a pass is ended after every n of its draws and begun again on the same attachments (every load op LOAD: clears folded into
     // the first part's load ops are not run again), with a cut before it (begin_pass, g_psplit_now), so its first parts reach the GPU while the replay records the rest:
     // DM_VK_CB_DRAWS cuts only between passes, and Unicorn Overlord's battle map draws ~2,030 of its ~3,546 draws in one 1280x720 pass (13.3 ms of GPU, all after its
@@ -1659,7 +1717,8 @@ static int prepare_draw(int prim, int indexed) {
     // depth buffer begun in an earlier command buffer meets Adreno's stale LRZ (begin_pass). DM_VK_PASS_SPLIT_DEPTH=1 (live, A/B) splits those too, with begin_pass's
     // write-back of a depth texel (lrz_touch) before the second part. The pipeline, dynamic state, sets and buffers are bound again (vk_end_pass, g_cmd_gen); deferred
     // uniform updates stay deferred (the draws read their shadows), as at any cut. Only while vk_cmd_split can still begin a part: otherwise the pass would be cut for nothing
-    if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)g_psplit && !S.rast_discard && (!S.daspect || g_psplit_depth)) {
+    if (g_gsb_cap) { if (S.pass_open != 1) return 0; }   // (its effects draw opened no pass: nothing to follow)
+    else if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)g_psplit && !S.rast_discard && g_gs_split_mode != 3 && (!S.daspect || g_psplit_depth)) {
         int vk_cmd_parts_left(void); if (vk_cmd_parts_left() > 0) { { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) after %llu draws, depth %d", g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, S.dfmt); }
             vk_sync_end_at(__FILE__, __LINE__); g_psplit_now = 1; } }
     else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !g_psplit_depth) { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) has depth (format %d): not split", g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt); }
@@ -1749,6 +1808,7 @@ static int prepare_draw(int prim, int indexed) {
         g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1];
         if (g_pass_wmem || shader_wmem(S.sh[0]) || shader_wmem(fs) || shader_wmem(S.sh[2]) || order_feedback(3)) {
             g_order_ended++; vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd());
+            if (S.rast_discard || g_gs_split_mode == 3) rd_note();   // (a batch drawn at that end closed the run of rasterizer discard: this draw begins the next)
             if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
             cb = vk_cmd();
         } else g_order_kept++;
@@ -1775,7 +1835,8 @@ static int prepare_draw(int prim, int indexed) {
     if(g_vk_sync_level>=2) {
         uint64_t keys[3]={k.key[0],k.raster_discard ? 0:k.key[1],k.key[2]};
         vkshader_t *gs=S.sh[2] ? vk_shader_gs_topo(S.sh[2],(VkPrimitiveTopology)k.topo):NULL;if(gs)keys[2]=gs->key;
-        vk_sync_pass_shader(keys,k.gs_split | k.raster_discard<<2 | k.fdz<<3 | k.dual<<4,k.topo);
+        if(g_gsb_cap){memcpy(g_gsb_cap->keys,keys,sizeof keys);g_gsb_cap->variant=k.gs_split | k.raster_discard<<2 | k.fdz<<3 | k.dual<<4;g_gsb_cap->topo=k.topo;} // counted in the pass that draws it
+        else vk_sync_pass_shader(keys,k.gs_split | k.raster_discard<<2 | k.fdz<<3 | k.dual<<4,k.topo);
         for(int st=0;st<3;++st) if(S.sh[st] && !(st==1 && k.raster_discard)) {
             for(int b=0;b<S.sh[st]->nbind;++b) {
                 const dmsv_bind *r=&S.sh[st]->b[b]; if(r->reg<0||r->reg>=16)continue;
@@ -1785,26 +1846,22 @@ static int prepare_draw(int prim, int indexed) {
             for(int j=0;j<g_stn[st] && j<32;++j)vk_sync_pass_resource(g_stimg[st][j].pool,g_stimg[st][j].off,g_stimg[st][j].size,1u<<st,1,100);
         }
     }
+    if (g_gsb_cap) { gsb_draw *e = g_gsb_cap; e->p = p;   // a batch's rasterization: the pipeline and the dynamic state's source now, bound by gsb_flush
+        gsb_dyn_get(&e->dyn); }
+    else {
     g_vkst.draws++; if (++g_pass_draws > g_vkst.max_pass_draws) g_vkst.max_pass_draws = g_pass_draws;
     if (p != S.bound_pipe) { uint64_t tb = g_prof_on ? tick() : 0; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; if (g_prof_on) g_prof_ns[4] += tick() - tb; }
     set_dynamic(cb);
     if (var == 1) { vkCmdSetDepthBias(cb, 0, 0, 0); memset(&g_bc.po, 0xff, sizeof g_bc.po); }
+    }
     uint32_t at[6] = {0};   // where each set's dynamic offsets start in dall
     for (int i = 0; i < nsets; i++) { at[i] = ndofs; for (int st = 0; st < 3; st++)   // the dynamic offsets: by set, then binding
         if (S.sh[st] && !(st == 1 && k.raster_discard) && S.sh[st]->set == i) { memcpy(dall + ndofs, dofs[i], sizeof(uint32_t) * (size_t)S.sh[st]->ndyn); ndofs += (uint32_t)S.sh[st]->ndyn; } }
     at[nsets] = ndofs;
     for (int i = 0; i < nsets; i++) if (!sets[i]) sets[i] = vk_alloc_set(dsl[i]);   // an absent stage's set: from the empty layout vk_pipeline_layout filled in
-    // DM_VK_SETSPLIT=1 (live): under the same layout, only the run of sets whose handle or dynamic offsets changed is bound again. Adreno's vkCmdBindDescriptorSets
-    // took ~22% of the replay thread on Unicorn Overlord's battle map (one load in it), and a draw that moves only its vertex stage's offsets sent the fragment set too
-    if (!(dbg_draw() & 4) && g_setsplit && !bc_fresh() && g_bc.lay == layout && g_bc.nsets == (uint32_t)nsets && g_bc.ndofs == ndofs) {
-        int lo = -1, hi = -1;
-        for (int i = 0; i < nsets; i++) if (g_bc.sets[i] != sets[i] || memcmp(g_bc.dofs + at[i], dall + at[i], sizeof *dall * (at[i + 1] - at[i]))) { if (lo < 0) lo = i; hi = i; }
-        if (lo >= 0) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, (uint32_t)lo, (uint32_t)(hi - lo + 1), sets + lo, at[hi + 1] - at[lo], dall + at[lo]);
-            memcpy(g_bc.sets + lo, sets + lo, sizeof *sets * (size_t)(hi - lo + 1)); memcpy(g_bc.dofs + at[lo], dall + at[lo], sizeof *dall * (at[hi + 1] - at[lo])); } }
-    else if (!(dbg_draw() & 4)) { int fresh = bc_fresh();
-        if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets, sets, sizeof *sets * (size_t)nsets) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, (uint32_t)nsets, sets, ndofs, dall);
-            g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
+    if (g_gsb_cap) { gsb_draw *e = g_gsb_cap; if (ndofs > GSB_DOFS - g_gsb.ndofs) e->ok = -1;   // the sets and offsets as they are now (the deferred updates' shadows): gsb_flush binds them
+        else { e->lay = layout; e->nsets = (uint32_t)nsets; memcpy(e->sets, sets, sizeof e->sets); e->ndofs = ndofs; e->dofs_at = g_gsb.ndofs; memcpy(g_gsb.dofs + g_gsb.ndofs, dall, sizeof *dall * ndofs); memcpy(e->at, at, sizeof e->at); } }
+    else bc_sets(cb, layout, nsets, sets, ndofs, dall, at);
     // vertex buffers
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;
@@ -1812,7 +1869,7 @@ static int prepare_draw(int prim, int indexed) {
         else if (!vk_buf_at(S.vbuf[b].address, 1, &buf, &off)) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
         else if (S.vbuf[b].size) { vkpool_t *vp = vk_pool_of(S.vbuf[b].address, 1); if (vp && S.vbuf[b].address + S.vbuf[b].size > vp->hi && vp->hi < vp->end) vk_cross(2, S.vbuf[b].address, S.vbuf[b].size, vp); }
         if (g_var_now == 5) { buf = vk_zero_buffer(); off = 0; }
-        if (!(dbg_draw() & 2) && b < 17) { int fresh = bc_fresh(); if (fresh || g_bc.vb[b] != buf || g_bc.vo[b] != off) { vkCmdBindVertexBuffers(cb, b, 1, &buf, &off); g_bc.vb[b] = buf; g_bc.vo[b] = off; } }
+        if (!(dbg_draw() & 2) && b < 17) bc_vbuf(cb, b, buf, off);
     }
     (void)indexed;
     return 1;
@@ -2005,7 +2062,7 @@ static void vbuf_bound(VkCommandBuffer cb, uint32_t first, uint32_t nvert, uint3
         if (n > (16u << 20)) { VKRED_ONCE(87, "vertex stream %u: a draw reads %llu bytes of a %llu-byte binding: not bounded", s, (unsigned long long)n, (unsigned long long)sz); continue; }
         VkBuffer b; VkDeviceSize o; uint8_t *p = vk_scratch(n, 16, &b, &o);
         vk_ubd_read(S.vbuf[s].address, sz, p); memset(p + sz, 0, (size_t)(n - sz));
-        vkCmdBindVertexBuffers(cb, s, 1, &b, &o); g_bc.vb[s] = b; g_bc.vo[s] = o;
+        if (g_gsb_cap) bc_vbuf(cb, s, b, o); else { vkCmdBindVertexBuffers(cb, s, 1, &b, &o); g_bc.vb[s] = b; g_bc.vo[s] = o; }
         if (g_vbound_n++ < 8) VKLOG("vertex stream %u: draw of %u vertices from %u (shader %016llx) reads %llu bytes past its bound %llu: bound as a copy padded with zeros",
                                     s, nvert, first, (unsigned long long)vsh->key, (unsigned long long)(n - sz), (unsigned long long)sz);
     }
@@ -2033,7 +2090,7 @@ static int mdi_group(uint64_t cnt, uint64_t ind, int i, int max, int stride, int
     return 0;
 }
 // GS stores on Adreno run once per possible output vertex. Keep their effects in
-// a discarded one-output pass, then rasterize without the stores. On NieR's index
+// a pass of one-invocation draws without output (gs_fx), then rasterize without the stores. On NieR's index
 // builders this changed three copies of each triangle to one and recovered the
 // colour pass without changing depth comparisons. Indirect arguments, XFB, user
 // UBO/image aliases and VS memory effects stay on the original path.
@@ -2075,12 +2132,100 @@ static int gs_split_draw(int prim, uint64_t indirect, uint64_t ibuf, uint64_t in
     if (!on || g_gs_split_mode || indirect || g_tf_on || g_bc_slot >= 0 || !S.sh[2] || !S.sh[0] || S.sh[0]->xfb || shader_wmem(S.sh[0]) || g_spv_alt) return 0;
     vkshader_t *gs = vk_shader_gs_topo(S.sh[2], topo(prim == 7 ? 4 : prim));
     if (!gs || (S.sh[1] && (S.sh[1]->in_locs & ~gs->out_locs))) return 0;
-    return vk_shader_gs_split_ready(gs) && gs_split_inputs_safe(gs, ibuf, in);
+    g_gsb_gs = gs; return vk_shader_gs_split_ready(gs) && gs_split_inputs_safe(gs, ibuf, in);
+}
+// A run of split draws as one batch. Each draw's effects go into one pass as they are replayed (gs_fx), and its rasterization is recorded (prepare_draw with g_gsb_cap:
+// the pipeline, the sets with the deferred updates' shadows as they are at that point, buffers and dynamic state) and drawn by gsb_flush where that pass ends, whatever
+// ends it (vk_end_pass), in one pass on the same targets after one barrier and one read of the run's buffers. Draw i's rasterization then follows the effects of the
+// draws after it, so a draw joins only while that changes nothing either can see:
+// - the effects write only the geometry stage's storage buffers (spv_gs_split; the vertex stage writes nothing, gs_split_draw) and read only buffers: no image, so no
+//   target the rasterization before them writes;
+// - the rasterization writes only the targets (its fragment shader writes no memory), and nothing it reads through a buffer (indices, vertex streams, each stage's
+//   uniform and storage buffers) overlaps a buffer the batch's effects write. A fragment stage's sampled images are no buffer; any other binding that may conceal one
+//   (texel buffers, handles or addresses read from memory) keeps the draw out;
+//   The ranges the waiting draws read are kept (g_gsb.r); a draw whose effects write into one of them begins a new batch, after the open one is drawn.
+// The effects keep their order among themselves, and so do the rasterizations. Anything else replayed in between (another draw, a clear, a barrier, a copy, a dispatch,
+// new targets) ends the pass first and so follows the whole batch.
+static int gsb_range(uint64_t a, uint64_t n, uint64_t (*r)[2], int *nr) {   // 0: a bound range of unknown size, or too many
+    if (!a) return 1;
+    if (!n || n > UINT64_MAX - a || *nr == 64) return 0;
+    r[*nr][0] = a; r[(*nr)++][1] = n; return 1;
+}
+static int gsb_reads(const vkshader_t *s, int st, uint64_t (*r)[2], int *nr) {   // the buffers a stage reads; 0: a binding that may conceal one
+    for (int i = 0; s && i < s->nbind; i++) { const dmsv_bind *b = s->b + i;
+        if (b->kind == RK_SUPPORT || b->kind == RK_DRV || b->kind == RK_C1) continue;
+        if (st == 1 && (b->kind == RK_TEX || b->kind == RK_TEX_C2A || b->kind == RK_TEX_UBO || b->kind == RK_TEXD || b->kind == RK_SAMPD)) continue;
+        if (b->reg < 0 || b->reg >= 16) return 0;
+        if (b->kind == RK_CBUF || b->kind == RK_UBO_PTR) { if (!gsb_range(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, r, nr)) return 0; }
+        else if (b->kind == RK_SBUF) { if (st != 2 && !gsb_range(S.ssbo[st][b->reg].addr, S.ssbo[st][b->reg].size, r, nr)) return 0; }   // (the geometry stage's: the effects' writes, which its outputs do not depend on)
+        else return 0;
+    }
+    return 1;
+}
+static int gsb_join(uint64_t ibuf, uint64_t in) {   // 1: the split draw being replayed is drawn as part of a batch (the open one, or a new one after the open one is drawn)
+    vkshader_t *gs = g_gsb_gs;
+    if (!g_gs_batch || g_x_rdkeep || g_bis_on || g_bis_trace >= 0 || dbg_draw() || shader_wmem(S.sh[1])) return 0;
+    uint64_t rd[64][2], wr[GSB_W][2]; int nrd = 0, nwr = 0;
+    for (int i = 0; i < gs->nbind; i++) if (gs->b[i].kind == RK_SBUF) { const p_bind_buf *w = &S.ssbo[2][gs->b[i].reg]; int have = 0;   // (gs_split_inputs_safe: each has an address and a size)
+        for (int j = 0; j < nwr; j++) have |= wr[j][0] == w->addr && wr[j][1] == w->size;
+        if (!have) { if (nwr == GSB_W) return 0; wr[nwr][0] = w->addr; wr[nwr++][1] = w->size; } }
+    if (!gsb_range(ibuf, in, rd, &nrd)) return 0;
+    for (int v = 0; v < 16; v++) if (!gsb_range(S.vbuf[v].address, S.vbuf[v].size, rd, &nrd)) return 0;
+    if (!gsb_reads(S.sh[0], 0, rd, &nrd) || !gsb_reads(gs, 2, rd, &nrd) || !gsb_reads(S.sh[1], 1, rd, &nrd)) return 0;
+    for (int j = 0; j < nrd; j++) for (int q = 0; q < nwr; q++) if (gs_ranges_overlap(wr[q][0], wr[q][1], rd[j][0], rd[j][1])) return 0;   // its own (gs_split_inputs_safe: the vertex stage's)
+    if (g_gsb.n) {   // what it writes against what the waiting draws read
+        int why = g_gsb.n == GSB_MAX || g_gsb.ndofs > GSB_DOFS - 3 * 96 || g_gsb.nr + nrd > GSB_R ? 2 : 0;
+        for (int q = 0; !why && q < nwr; q++) if (wr[q][0] < g_gsb.rhi && g_gsb.rlo < wr[q][0] + wr[q][1])
+            for (int j = 0; j < g_gsb.nr; j++) if (gs_ranges_overlap(wr[q][0], wr[q][1], g_gsb.r[j][0], g_gsb.r[j][1])) { why = 1;
+                static int said; if (said++ < 4) VKLOG("split geometry batch of %d ended: a draw's effects write %#llx +%llu, which a waiting draw reads (%#llx +%llu)", g_gsb.n, (unsigned long long)wr[q][0], (unsigned long long)wr[q][1], (unsigned long long)g_gsb.r[j][0], (unsigned long long)g_gsb.r[j][1]);
+                break; }
+        if (why) { if (why == 1) g_gsb_wr++; else g_gsb_full++; vk_sync_end_at(__FILE__, __LINE__); }   // the open batch is drawn; this draw begins the next
+    }
+    if (!g_gsb.n) { g_gsb.nr = 0; g_gsb.rlo = UINT64_MAX; g_gsb.rhi = 0; }
+    g_gsb.r0 = g_gsb.nr;
+    for (int j = 0; j < nrd; j++) { unsigned h = (unsigned)((rd[j][0] >> 6 ^ rd[j][1]) * 2654435761u) >> 24; int at = g_gsb.rc[h];   // a range the batch already has (shared streams and constants) is not put again
+        if (at < g_gsb.nr && g_gsb.r[at][0] == rd[j][0] && g_gsb.r[at][1] == rd[j][1]) continue;
+        g_gsb.rc[h] = (uint16_t)g_gsb.nr; g_gsb.r[g_gsb.nr][0] = rd[j][0]; g_gsb.r[g_gsb.nr++][1] = rd[j][1];
+        if (rd[j][0] < g_gsb.rlo) g_gsb.rlo = rd[j][0]; if (rd[j][0] + rd[j][1] > g_gsb.rhi) g_gsb.rhi = rd[j][0] + rd[j][1]; }
+    return 1;
+}
+static void gs_fx(int discard) { g_gs_split_mode = g_gs_fx_discard ? 1 : 3; S.rast_discard = g_gs_fx_discard || discard; }   // a split draw's effects: discard the game's own, or the one point's
+static void gsb_fx(void) { g_gsb_fx = 1; gs_fx(0); }   // the effects draw, into the batch's effects pass
+static void gsb_cap_begin(void) { g_gsb_fx = 0; g_gs_split_mode = 2; S.rast_discard = 0; g_gsb_cap = &g_gsb.d[g_gsb.n]; memset(g_gsb_cap, 0, sizeof *g_gsb_cap); }   // then its rasterization, recorded
+static void gsb_cap_end(void) { gsb_draw *e = g_gsb_cap; g_gsb_cap = NULL; g_gs_split_mode = 0; if (e->ok == 1) { g_gsb.ndofs += e->ndofs; g_gsb.n++; g_gsb_draws++; g_gsb_verts += (uint64_t)e->count * e->inst; } }
+static int gsb_cap_draw(int indexed, uint32_t count, uint32_t inst, uint32_t first, int32_t vofs, uint32_t binst) {   // 1: the draw call went to the batch
+    gsb_draw *e = g_gsb_cap; if (!e) return 0;
+    e->indexed = (uint32_t)indexed; e->count = count; e->inst = inst; e->first = first; e->vofs = vofs; e->binst = binst; if (!e->ok) e->ok = 1; return 1;
+}
+static void gsb_flush(void) {   // from vk_end_pass, the batch's effects pass just ended
+    int n = g_gsb.n; g_gsb.n = 0; g_gsb.ndofs = 0;   // (the pass below ends through vk_end_pass too)
+    // The ranges the drawn rasterizations read go; those of an effects draw being replayed (its pass ended under it: an order-only barrier, prepare_draw) stay, for its own rasterization
+    if (g_gsb_fx) { memmove(g_gsb.r, g_gsb.r + g_gsb.r0, sizeof *g_gsb.r * (size_t)(g_gsb.nr - g_gsb.r0)); g_gsb.nr -= g_gsb.r0; } else g_gsb.nr = 0;
+    g_gsb.r0 = 0; g_gsb.rlo = UINT64_MAX; g_gsb.rhi = 0; memset(g_gsb.rc, 0xff, sizeof g_gsb.rc);
+    for (int j = 0; j < g_gsb.nr; j++) { if (g_gsb.r[j][0] < g_gsb.rlo) g_gsb.rlo = g_gsb.r[j][0]; if (g_gsb.r[j][0] + g_gsb.r[j][1] > g_gsb.rhi) g_gsb.rhi = g_gsb.r[j][0] + g_gsb.r[j][1]; }
+    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb); vk_sync_gs_mark(cb, 1);
+    if (g_rd_touch) rd_read(g_rd_wa, g_rd_nwa);   // the run of rasterizer discard ends here (prepare_draw)
+    g_rd_prev = 0;
+    if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt += (uint64_t)n; vk_sync_end_at(__FILE__, __LINE__); return; }
+    cb = vk_cmd(); gsb_dyn now; gsb_dyn_get(&now); int rd = S.rast_discard; S.rast_discard = 0;
+    for (int i = 0; i < n; i++) { const gsb_draw *e = &g_gsb.d[i];
+        if (g_vk_sync_level >= 2) vk_sync_pass_shader(e->keys, e->variant, e->topo);
+        g_vkst.draws++; if (++g_pass_draws > g_vkst.max_pass_draws) g_vkst.max_pass_draws = g_pass_draws;
+        if (e->p != S.bound_pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->p); S.bound_pipe = e->p; }
+        gsb_dyn_set(&e->dyn); set_dynamic(cb);
+        bc_sets(cb, e->lay, (int)e->nsets, e->sets, e->ndofs, g_gsb.dofs + e->dofs_at, e->at);
+        for (uint32_t v = 0; v < e->nvb; v++) bc_vbuf(cb, e->vb[v].b, e->vb[v].buf, e->vb[v].off);
+        if (e->indexed) { bc_index(cb, e->ib, e->io, e->it); vkCmdDrawIndexed(cb, e->count, e->inst, 0, e->vofs, e->binst); }
+        else vkCmdDraw(cb, e->count, e->inst, e->first, e->binst);
+    }
+    gsb_dyn_set(&now); S.rast_discard = rd; g_gsb_batches++;
+    vk_sync_end_at(__FILE__, __LINE__);
 }
 static void draw(const p_draw *d) {
     if (gs_split_draw(d->prim, d->ind, 0, 0)) {
         int discard = S.rast_discard;
-        g_gs_split_mode = 1; S.rast_discard = 1; draw(d);
+        if (!discard && gsb_join(0, 0)) { gsb_fx(); draw(d); gsb_cap_begin(); draw(d); gsb_cap_end(); return; }
+        gs_fx(discard); draw(d);
         vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd());
         vk_sync_gs_mark(vk_cmd(), !discard);
         S.rast_discard = discard;
@@ -2116,7 +2261,7 @@ static void draw(const p_draw *d) {
         vbuf_bound(cb, (uint32_t)d->first, nq * 4, (uint32_t)d->base_instance, inst);
         if (g_tf_on && S.sh[0] && S.sh[0]->xfb) VKRED_ONCE(85, "quads under transform feedback: not captured");
         VkBuffer qb = quad_index_buffer(&nq);
-        bc_index(cb, qb, 0, VK_INDEX_TYPE_UINT32); if (!(dbg_draw() & 1) && g_ok) vkCmdDrawIndexed(cb, nq * 6, inst, 0, g_var_now == 4 ? 0 : d->first, (uint32_t)d->base_instance); return; }
+        bc_index(cb, qb, 0, VK_INDEX_TYPE_UINT32); if (!(dbg_draw() & 1) && g_ok && !gsb_cap_draw(1, nq * 6, inst, 0, g_var_now == 4 ? 0 : d->first, (uint32_t)d->base_instance)) vkCmdDrawIndexed(cb, nq * 6, inst, 0, g_var_now == 4 ? 0 : d->first, (uint32_t)d->base_instance); return; }
     if (prim == 2) VKRED_ONCE(54, "line loops drawn as line strips");
     vbuf_bound(cb, (uint32_t)d->first, (uint32_t)d->count, (uint32_t)d->base_instance, inst);
     if (g_bc_slot >= 0) {   // DrawTransformFeedback of a geometry shader's capture: its vertex count is the counter's bytes over the stream's stride
@@ -2129,13 +2274,14 @@ static void draw(const p_draw *d) {
             { static int n; if (n++ < 6) VKLOG("transform feedback: DrawTransformFeedback by the counter of control buffer %#llx, stride %u%s", (unsigned long long)g_tf_ctl[g_bc_slot].ctl, st, xf == 2 ? ", captured again" : ""); } }
         return;
     }
-    if (!(dbg_draw() & 1) && g_ok) { int xf = xfb_begin(cb); vkCmdDraw(cb, (uint32_t)d->count, inst, (uint32_t)d->first, (uint32_t)d->base_instance); if (xf) xfb_end(cb, prim, (uint32_t)d->count, inst, xf); }
+    if (!(dbg_draw() & 1) && g_ok && !gsb_cap_draw(0, (uint32_t)d->count, inst, (uint32_t)d->first, 0, (uint32_t)d->base_instance)) { int xf = xfb_begin(cb); vkCmdDraw(cb, (uint32_t)d->count, inst, (uint32_t)d->first, (uint32_t)d->base_instance); if (xf) xfb_end(cb, prim, (uint32_t)d->count, inst, xf); }
 }
 static void draw_idx(const p_draw_idx *d) {
     uint64_t index_bytes = (uint64_t)(uint32_t)d->count * (d->itype == 0 ? 1u : d->itype == 1 ? 2u : 4u);
     if (gs_split_draw(d->prim, d->ind, d->ibuf, index_bytes)) {
         int discard = S.rast_discard;
-        g_gs_split_mode = 1; S.rast_discard = 1; draw_idx(d);
+        if (!discard && gsb_join(d->ibuf, index_bytes)) { gsb_fx(); draw_idx(d); gsb_cap_begin(); draw_idx(d); gsb_cap_end(); return; }
+        gs_fx(discard); draw_idx(d);
         vk_sync_end_at(__FILE__, __LINE__); vk_img_barrier_all(vk_cmd());
         vk_sync_gs_mark(vk_cmd(), !discard);
         S.rast_discard = discard;
@@ -2185,10 +2331,10 @@ static void draw_idx(const p_draw_idx *d) {
     if (d->ind) { VkBuffer b; VkDeviceSize o; bc_index(cb, ib, io, it); if (!vk_buf_at(d->ind, mcb ? (uint64_t)d->mdi_stride * (uint64_t)d->mdi_max : 20, &b, &o)) VKRED_ONCE(97, "indexed indirect draw arguments outside the memory pools");
         else if (!(dbg_draw() & 1) && g_ok) { if (mcb) vkCmdDrawIndexedIndirectCount(cb, b, o, mcb, mco, (uint32_t)d->mdi_max, (uint32_t)d->mdi_stride); else vkCmdDrawIndexedIndirect(cb, b, o, 1, 20); } return; }
     if (prim == 7) { VkBuffer b; VkDeviceSize o; int n = quad_indices((uint32_t)d->count, (const uint8_t *)(uintptr_t)d->ibuf, d->itype, 0, &b, &o); if (!n) return;
-        bc_index(cb, b, o, VK_INDEX_TYPE_UINT32); if (!(dbg_draw() & 1) && g_ok) vkCmdDrawIndexed(cb, (uint32_t)n, inst, 0, d->base_vertex, (uint32_t)d->base_instance); return; }
+        bc_index(cb, b, o, VK_INDEX_TYPE_UINT32); if (!(dbg_draw() & 1) && g_ok && !gsb_cap_draw(1, (uint32_t)n, inst, 0, d->base_vertex, (uint32_t)d->base_instance)) vkCmdDrawIndexed(cb, (uint32_t)n, inst, 0, d->base_vertex, (uint32_t)d->base_instance); return; }
     if (io % isz) { VKRED_ONCE(57, "index buffer offset not aligned to its index size"); return; }
     bc_index(cb, ib, io, it);
-    if (!(dbg_draw() & 1) && g_ok) { int xf = xfb_begin(cb); vkCmdDrawIndexed(cb, (uint32_t)d->count, inst, 0, d->base_vertex, (uint32_t)d->base_instance); if (xf) xfb_end(cb, prim, (uint32_t)d->count, inst, xf); }
+    if (!(dbg_draw() & 1) && g_ok && !gsb_cap_draw(1, (uint32_t)d->count, inst, 0, d->base_vertex, (uint32_t)d->base_instance)) { int xf = xfb_begin(cb); vkCmdDrawIndexed(cb, (uint32_t)d->count, inst, 0, d->base_vertex, (uint32_t)d->base_instance); if (xf) xfb_end(cb, prim, (uint32_t)d->count, inst, xf); }
 }
 static nvn_hmap g_cpipes = {.klen = 24};   // {shader, its integer-texel bindings}
 static pthread_mutex_t g_cpipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and compute_warm

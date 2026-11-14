@@ -1,9 +1,10 @@
 // Geometry memory effects separated from rasterization, without Vulkan dependencies.
 // Adreno executes a GS once per possible output vertex. An index builder that emits
 // three vertices consequently appended each triangle three times on both Turnip and
-// Qualcomm's driver. A one-output, discarded pass does the writes; a pure GS retains
-// the original rasterization. Only split when mutable memory cannot affect outputs
-// or control flow. The caller also excludes aliased user UBOs, images and XFB.
+// Qualcomm's driver. A GS of one possible output vertex does the writes, in a draw
+// of its own; a pure GS retains the original rasterization. Only split when mutable
+// memory cannot affect outputs or control flow. The caller also excludes aliased
+// user UBOs, images and XFB.
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -107,15 +108,17 @@ static uint32_t *gs_point_size(uint32_t *w, uint32_t *nw) {
     out[3] = next; *nw = no; return out;
 }
 
-// mode 1: one output point per invocation (run with rasterizer discard), 2: original
-// outputs with buffer stores/atomic writes removed. NULL is a conservative refusal;
-// why describes it. The caller must use both variants, or neither.
+// mode 1: the buffer effects and one output point per invocation (run with rasterizer
+// discard), 2: original outputs with buffer stores/atomic writes removed, 3: the
+// buffer effects and no output at all (nothing reaches the rasterizer, so its draw
+// needs no rasterizer discard). NULL is a conservative refusal; why describes it.
+// The caller must use an effects variant and the raster variant, or neither.
 uint32_t *spv_gs_split(const uint32_t *w, uint32_t nw, int mode, uint32_t *onw, char *why, size_t nwhy) {
     gsid *t = NULL; uint32_t *out = NULL, *zero = NULL;
     const char *reason = "invalid module"; uint32_t bound = 0, entry = 0, fn = 0, maxverts = 0, topology = 0, firstfn = 0, writes = 0;
     if (onw) *onw = 0;
     if (why && nwhy) why[0] = 0;
-    if (!w || nw < 5 || w[0] != 0x07230203 || (mode != 1 && mode != 2) || !onw) goto fail;
+    if (!w || nw < 5 || w[0] != 0x07230203 || mode < 1 || mode > 3 || !onw) goto fail;
     bound = w[3]; if (!bound || bound > 1048576) goto fail;
     t = calloc(bound, sizeof *t); if (!t) { reason = "out of memory"; goto fail; }
     for (uint32_t v = 0; v < bound; v++) t[v].parent = v;
@@ -243,16 +246,16 @@ uint32_t *spv_gs_split(const uint32_t *w, uint32_t nw, int mode, uint32_t *onw, 
         if (i == firstfn && mode == 2) for (uint32_t ty = 0; ty < bound; ty++) if (zero[ty]) { out[no++] = 3u << 16 | 46; out[no++] = ty; out[no++] = zero[ty]; }
         if (op == 54) fn = x[2];
         if (op == 56) fn = 0;
-        if (mode == 1 && (op == 218 || op == 219)) { i += n; continue; }
+        if (mode != 2 && (op == 218 || op == 219)) { i += n; continue; }
         if (mode == 2 && ((op == 62 && (t[gs_root(t, x[1])].flags & GS_BUFFER)) || op == 228)) { i += n; continue; }
         if (mode == 2 && op >= 229 && op <= 242) {
             out[no++] = 4u << 16 | 83; out[no++] = x[1]; out[no++] = x[2]; out[no++] = zero[x[1]];
         } else {
             if (mode == 1 && op == 253 && fn == entry) { out[no++] = 1u << 16 | 218; out[no++] = 1u << 16 | 219; }
             memcpy(out + no, x, (size_t)n * 4);
-            if (mode == 1 && op == 16 && n >= 3 && x[1] == entry) {
-                if (x[2] >= 27 && x[2] <= 29) out[no + 2] = 27; // OutputPoints
-                if (x[2] == 26 && n == 4) out[no + 3] = 1;
+            if (mode != 2 && op == 16 && n >= 3 && x[1] == entry) {
+                if (mode == 1 && x[2] >= 27 && x[2] <= 29) out[no + 2] = 27; // OutputPoints
+                if (x[2] == 26 && n == 4) out[no + 3] = 1; // one invocation a primitive on Adreno
             }
             no += n;
         }

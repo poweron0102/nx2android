@@ -498,25 +498,24 @@ int vk_shader_gs_split_ready(vkshader_t *s) {
         int k = s->b[i].kind;
         if (k != RK_SUPPORT && k != RK_DRV && k != RK_C1 && k != RK_SBUF) { pthread_mutex_unlock(&g_sh_mu); return 0; }
     }
-    uint32_t nr = 0, ne = 0, *r = NULL, *e = NULL; char why[128];
-    r = spv_gs_split(s->spv, s->nspv, 2, &nr, why, sizeof why);
-    if (r) e = spv_gs_split(s->spv, s->nspv, 1, &ne, why, sizeof why);
-    if (e) {
+    uint32_t *m[3] = {NULL, NULL, NULL}, nm[3] = {0, 0, 0}; char why[128];   // spv_gs_split's modes 1-3: effects as one point, rasterization, effects without output
+    m[1] = spv_gs_split(s->spv, s->nspv, 2, &nm[1], why, sizeof why);
+    for (int v = 0; v < 3 && m[1]; v += 2) {
+        if (!(m[v] = spv_gs_split(s->spv, s->nspv, v + 1, &nm[v], why, sizeof why))) break;
         // Adreno's GS subgroup includes the physical output-vertex threads. Run
         // guest warp scalarization in singleton groups in the effects pass.
-        uint32_t nn = 0, *one = spv_one_lane(e, ne, 0, &nn, why, sizeof why);
-        if (one) { free(e); e = one; ne = nn; }
-        else if (why[0]) { free(e); e = NULL; }
+        uint32_t nn = 0, *one = spv_one_lane(m[v], nm[v], 0, &nn, why, sizeof why);
+        if (one) { free(m[v]); m[v] = one; nm[v] = nn; }
+        else if (why[0]) { free(m[v]); m[v] = NULL; break; }
     }
-    if (e && r) {
-        VkShaderModuleCreateInfo ei = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)ne * 4, e};
-        VkShaderModuleCreateInfo ri = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nr * 4, r};
-        VkResult a = vkCreateShaderModule(V.dev, &ei, NULL, &s->gs_mod[0]);
-        VkResult b = a ? a : vkCreateShaderModule(V.dev, &ri, NULL, &s->gs_mod[1]);
-        if (!a && !b) { s->gs_split = 1; VKLOG("geometry shader %016llx: buffer effects separated from rasterization", (unsigned long long)s->key); }
-        else { if (s->gs_mod[0]) vkDestroyShaderModule(V.dev, s->gs_mod[0], NULL); if (s->gs_mod[1]) vkDestroyShaderModule(V.dev, s->gs_mod[1], NULL); s->gs_mod[0] = s->gs_mod[1] = VK_NULL_HANDLE; }
+    if (m[0] && m[1] && m[2]) {
+        VkResult bad = VK_SUCCESS;
+        for (int v = 0; v < 3 && !bad; v++) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nm[v] * 4, m[v]}; bad = vkCreateShaderModule(V.dev, &ci, NULL, &s->gs_mod[v]); }
+        if (!bad) { s->gs_split = 1; VKLOG("geometry shader %016llx: buffer effects separated from rasterization", (unsigned long long)s->key); }
+        else for (int v = 0; v < 3; v++) { if (s->gs_mod[v]) vkDestroyShaderModule(V.dev, s->gs_mod[v], NULL); s->gs_mod[v] = VK_NULL_HANDLE; }
     }
-    free(e); free(r); int ok = s->gs_split == 1;
+    for (int v = 0; v < 3; v++) free(m[v]);
+    int ok = s->gs_split == 1;
     pthread_mutex_unlock(&g_sh_mu); return ok;
 }
 

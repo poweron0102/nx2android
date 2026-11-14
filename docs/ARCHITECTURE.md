@@ -56,22 +56,34 @@ Copied pools can opt into host-cached memory with `DM_VK_POOL_CACHED=1` (off by 
 Vulkan indirect compute dispatches copy their three GPU-written group counts into submission scratch memory in command order. A shader that reads c0 gets a private driver segment, outside the immutable segment cache, with the counts at `c0 + 0x200`; the dispatch reads that same record. Without c0, only a 12-byte record is allocated. Argument records may cross chunks of the same pool, with each chunk's buffer offset preserved. All words are validated before any argument copy, and a transfer barrier makes the record visible to both uniform reads and indirect dispatch. Scratch storage is retained until the submission completes. Direct compute dispatches and other driver segments retain their existing content caching.
 
 On Adreno, eligible direct geometry draws separate buffer effects from rasterization
-(`gfx_vk_gs_split.c`, `gfx_vk_shader.c`, `gfx_vk_exec.c`). A discarded, single-output
-point shader runs the guest memory writes with singleton subgroups; a second shader
-retains the original primitive output but removes buffer stores and atomic writes.
-A pass boundary and memory barrier separate them. This avoids repeated index-buffer
+(`gfx_vk_gs_split.c`, `gfx_vk_shader.c`, `gfx_vk_exec.c`). An effects shader of one
+possible output vertex, which emits nothing, runs the guest memory writes with
+singleton subgroups; a second shader retains the original primitive output but
+removes buffer stores and atomic writes. The effects draw runs without rasterizer
+discard, since nothing reaches the rasterizer: Turnip on Adreno 725 ran the geometry
+stages of a rasterizer-discard pipeline at about three times the cost (NieR:Automata's
+220 effects draws: 11.2 ms a frame as one discarded point each, 3.0 ms without output
+or discard). `DM_VK_GS_FX_DISCARD=1` restores the single discarded point live.
+A pass boundary and memory barrier separate the two phases. Consecutive eligible
+draws form a batch: their effects share one pass, and their rasterization, recorded
+as Vulkan handles while each draw is replayed, follows in one pass after one barrier.
+A draw whose effects write a buffer range that a waiting rasterization reads begins
+a new batch, and anything else replayed in between ends the pass and so follows the
+whole batch. `DM_VK_GS_BATCH=0` draws one split draw at a time, live (two passes and
+their barriers per draw). The split avoids repeated index-buffer
 appends observed with three-output software geometry passthrough on both Turnip and
 Qualcomm's driver. The SPIR-V analysis rejects mutable data reaching raster outputs
 or control flow, including through local memory, helper parameters/returns and
 subgroup operations. Unsupported pointer aliases, extension instructions, XFB,
 images and user UBOs retain the original path, as do indirect draws, captured command
 blocks, single-output geometry and vertex shaders with memory effects. Devices
-without geometry PointSize support also retain the original path. Both immutable shader modules must
-exist before either pass is selected. Pipeline keys distinguish the two phases;
+without geometry PointSize support also retain the original path. All three immutable shader modules
+(both effects forms and the raster form) must exist before either pass is selected. Pipeline keys distinguish them;
 the GS buffers must not overlap vertex/index fetch or the VS's direct buffer reads,
 and VS textures or indirect handles conservatively retain the original path.
-PPE3 invalidates older prewarm records. The effects shader writes PointSize, and
-discarded pipelines invalidate cached stencil state before the next raster draw.
+PPE3 invalidates older prewarm records. The single-point effects shader writes PointSize, and
+discarded pipelines invalidate cached stencil state before the next raster draw. Effects
+pipelines are never built late: a skipped effects draw would lose its writes.
 `DM_VK_GS_SPLIT=0` restores the original path live for diagnosis. Other vendors keep
 the original default; other Adreno games still need rendering regression coverage.
 
